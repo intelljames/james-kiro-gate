@@ -17,7 +17,7 @@ export interface OpenAIChatRequest {
 }
 
 export interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool'
+  role: 'system' | 'developer' | 'user' | 'assistant' | 'tool'
   content: string | OpenAIContentPart[]
   name?: string
   tool_calls?: OpenAIToolCall[]
@@ -251,54 +251,6 @@ export interface ProxyAccount {
   disabled?: boolean
 }
 
-export interface ProxyConfig {
-  enabled: boolean
-  port: number
-  host: string
-  apiKey?: string
-  apiKeys?: ApiKey[]
-  enableMultiAccount: boolean
-  selectedAccountIds: string[]
-  logRequests: boolean
-  maxConcurrent: number
-  maxRetries?: number
-  retryDelayMs?: number
-  preferredEndpoint?: 'codewhisperer' | 'amazonq'
-  tokenRefreshBeforeExpiry?: number
-  autoContinueRounds?: number
-  disableTools?: boolean
-  autoSwitchOnQuotaExhausted?: boolean
-  rateLimitPerMinute?: number
-  enableContextCompression?: boolean
-  compressionTokenThreshold?: number
-  compressionKeepMessages?: number
-  thinkingMode?: 'off' | 'on'
-  modelThinkingOverrides?: Record<string, 'default' | 'on' | 'off'>
-  modelThinkingBudgets?: Record<string, number>
-  thinkingOutputFormat?: 'reasoning_content' | 'thinking' | 'think'
-  streamReadTimeout?: number
-  enableConcurrencyLimit?: boolean
-  maxConcurrentRequests?: number
-  maxQueueSize?: number
-  queueTimeoutMs?: number
-  globalRatePerMinute?: number
-  perAccountRatePerMinute?: number
-  loadBalancingMode?: 'smart' | 'priority' | 'balanced'
-  modelMappings?: ModelMappingRule[]
-  disabledModels?: string[]
-  modelContextLengths?: Record<string, number>
-}
-
-export interface ModelMappingRule {
-  id: string
-  name: string
-  enabled: boolean
-  type: 'replace' | 'alias' | 'loadbalance'
-  sourceModel: string
-  targetModels: string[]
-  weights?: number[]
-  priority: number
-}
 
 // ============ 统计和日志 ============
 export interface AccountStats {
@@ -310,45 +262,6 @@ export interface AccountStats {
   lastUsed: number
   avgResponseTime: number
   totalResponseTime: number
-}
-
-export interface ProxyStats {
-  totalRequests: number
-  successRequests: number
-  failedRequests: number
-  totalTokens: number
-  totalCredits: number
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheWriteTokens: number
-  reasoningTokens: number
-  compressionCount: number
-  tokensSavedByCompression: number
-  cacheHits: number
-  cacheMisses: number
-  startTime: number
-  accountStats: Map<string, AccountStats>
-  endpointStats: Map<string, EndpointStats>
-  modelStats: Map<string, ModelStats>
-  recentRequests: RequestLog[]
-}
-
-export interface EndpointStats {
-  name: string
-  requests: number
-  successes: number
-  failures: number
-  quotaErrors: number
-}
-
-export interface ModelStats {
-  model: string
-  requests: number
-  tokens: number
-  inputTokens: number
-  outputTokens: number
-  credits: number
 }
 
 export interface RequestLog {
@@ -427,23 +340,4 @@ export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN'
 
 // ============ 负载均衡模式 ============
 export type LoadBalancingMode = 'smart' | 'priority' | 'balanced'
-
-// ============ 全局设置 ============
-export interface AppSettings {
-  port: number
-  adminPassword?: string
-  jwtSecret?: string
-  logLevel: 'debug' | 'info' | 'warn' | 'error'
-  proxyConfig: ProxyConfig
-}
-
-// ============ Token 刷新回调 ============
-export type TokenRefreshCallback = (account: ProxyAccount) => Promise<{
-  success: boolean
-  accessToken?: string
-  refreshToken?: string
-  expiresAt?: number
-  subscriptionType?: string
-  error?: string
-}>
 

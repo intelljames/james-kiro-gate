@@ -10,8 +10,8 @@
 // ============================================================================
 // 模块导入
 // ============================================================================
-import type { ProxyAccount } from './lib/types.ts'
-import { logger } from './lib/logger.ts'
+import type { ProxyAccount, RequestLog } from './lib/types.ts'
+import { logger, setLogLevel } from './lib/logger.ts'
 import {
   initStorage, closeStorage,
   setAccount as storageSetAccount,
@@ -25,11 +25,11 @@ import { AccountPool } from './lib/accountPool.ts'
 import {
   fetchKiroModels, updateModelCache, getCachedModels,
   callKiroApiStream, callKiroApi, prewarmDNS,
-  getEndpointHealthStats, getDNSCacheStats, isThinkingEnabled
+  getEndpointHealthStats, getDNSCacheStats, summarizeKiroPayload
 } from './lib/kiroApi.ts'
 import {
   openaiToKiro, claudeToKiro, kiroToOpenaiResponse, kiroToClaudeResponse,
-  isThinkingModel, isClaudeThinkingEnabled
+  isThinkingModel, isClaudeThinkingEnabled, getThinkingBudgetFromRequest
 } from './lib/translator.ts'
 import {
   ClaudeStreamHandler, OpenAIStreamHandler, claudeSSE, openaiSSE
@@ -49,7 +49,7 @@ import {
 // ============================================================================
 // 静态资源代理基地址
 // ============================================================================
-const PROXY_BASE = "https://proxy.jhun.edu.kg";
+const PROXY_BASE = "";
 
 // 应用配置
 // ============================================================================
@@ -63,6 +63,7 @@ interface AppSettings {
   logLevel: string
   rateLimitPerMinute: number
   enableCompression: boolean
+  debugPayload: boolean
 }
 
 function loadSettings(): AppSettings {
@@ -73,6 +74,7 @@ function loadSettings(): AppSettings {
     logLevel: Deno.env.get('LOG_LEVEL') || 'INFO',
     rateLimitPerMinute: parseInt(Deno.env.get('RATE_LIMIT_PER_MINUTE') || '0'),
     enableCompression: Deno.env.get('ENABLE_COMPRESSION') !== 'false',
+    debugPayload: Deno.env.get('DEBUG_KIRO_PAYLOAD') === 'true',
   }
 }
 
@@ -86,19 +88,41 @@ const rateLimiter = new RateLimiter()
 const circuitBreaker = new CircuitBreaker(5, 60000)
 
 // 请求统计
+type DashboardRequestLog = {
+  timestamp: number
+  method: string
+  path: string
+  status: number
+  duration: number
+  model?: string
+  apiType?: string
+  error?: string
+  accountId?: string
+  tokens?: number
+}
+
+type PersistedStats = {
+  totalRequests?: number
+  successRequests?: number
+  errorRequests?: number
+  streamRequests?: number
+  nonStreamRequests?: number
+  totalTokens?: number
+  totalInputTokens?: number
+  totalOutputTokens?: number
+  startTime?: number
+}
+
 const metrics = {
   totalRequests: 0, successRequests: 0, errorRequests: 0,
   streamRequests: 0, nonStreamRequests: 0,
   totalTokens: 0, totalInputTokens: 0, totalOutputTokens: 0,
-  startTime: Date.now(), requestLog: [] as Array<{
-    timestamp: number; method: string; path: string; status: number
-    duration: number; model?: string; apiType?: string; error?: string
-    accountId?: string; tokens?: number
-  }>
+  startTime: Date.now(), requestLog: [] as DashboardRequestLog[]
 }
 
 // Token 刷新相关
 const KIRO_REFRESH_URL = (region: string) => `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`
+const KIRO_IDC_TOKEN_URL = (region: string) => `https://oidc.${region}.amazonaws.com/token`
 
 // ============================================================================
 // Token 刷新
@@ -106,10 +130,32 @@ const KIRO_REFRESH_URL = (region: string) => `https://prod.${region}.auth.deskto
 async function refreshAccountToken(account: ProxyAccount): Promise<boolean> {
   if (!account.refreshToken) return false
   const region = account.region || 'us-east-1'
+  const isIdc =
+    account.authMethod === 'idc' ||
+    account.authMethod === 'IdC' ||
+    (!!account.clientId && !!account.clientSecret)
   try {
-    const resp = await fetch(KIRO_REFRESH_URL(region), {
+    if (isIdc && (!account.clientId || !account.clientSecret)) {
+      logger.error('Auth', `IDC refresh missing client credentials for ${account.email || account.id}`)
+      accountPool.markRefreshComplete(account.id, false, undefined, true)
+      return false
+    }
+
+    const refreshUrl = isIdc ? KIRO_IDC_TOKEN_URL(region) : KIRO_REFRESH_URL(region)
+    const requestBody = isIdc
+      ? {
+          refreshToken: account.refreshToken,
+          clientId: account.clientId,
+          clientSecret: account.clientSecret,
+          grantType: 'refresh_token'
+        }
+      : {
+          refreshToken: account.refreshToken
+        }
+
+    const resp = await fetch(refreshUrl, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: account.refreshToken })
+      body: JSON.stringify(requestBody)
     })
     if (!resp.ok) {
       const text = await resp.text()
@@ -128,7 +174,7 @@ async function refreshAccountToken(account: ProxyAccount): Promise<boolean> {
     accountPool.updateAccount(account.id, {
       accessToken: newToken,
       expiresAt: Date.now() + expiresIn * 1000,
-      refreshToken: data.refreshToken || account.refreshToken
+      refreshToken: data.refreshToken || data.refresh_token || account.refreshToken
     })
     accountPool.markRefreshComplete(account.id, true)
     logger.info('Auth', `Token refreshed for ${account.email || account.id}`)
@@ -157,12 +203,7 @@ function maskToken(token: string): string {
   return token.slice(0, 4) + '...' + token.slice(-4)
 }
 
-function recordRequest(entry: {
-  timestamp: number; method: string; path: string; status: number
-  duration: number; model?: string; apiType?: string; error?: string
-  accountId?: string; tokens?: number
-}) {
-  metrics.totalRequests++
+function recordRequest(entry: DashboardRequestLog) {
   if (entry.status < 400) metrics.successRequests++
   else metrics.errorRequests++
   if (entry.tokens) {
@@ -170,6 +211,39 @@ function recordRequest(entry: {
   }
   metrics.requestLog.push(entry)
   if (metrics.requestLog.length > 200) metrics.requestLog.shift()
+}
+
+function toPersistedRequestLogs(logs: DashboardRequestLog[]): RequestLog[] {
+  return logs.map((log) => ({
+    timestamp: log.timestamp,
+    path: log.path,
+    model: log.model || log.apiType || 'unknown',
+    accountId: log.accountId || 'unknown',
+    inputTokens: 0,
+    outputTokens: log.tokens || 0,
+    responseTime: log.duration,
+    success: log.status < 400,
+    error: log.error
+  }))
+}
+
+function fromPersistedRequestLogs(logs: RequestLog[]): DashboardRequestLog[] {
+  return logs.map((log) => ({
+    timestamp: log.timestamp,
+    method: 'POST',
+    path: log.path,
+    status: log.success ? 200 : 500,
+    duration: log.responseTime,
+    model: log.model,
+    accountId: log.accountId,
+    tokens: log.inputTokens + log.outputTokens,
+    error: log.error
+  }))
+}
+
+function readStatNumber(stats: PersistedStats | null, key: keyof PersistedStats): number {
+  const value = stats?.[key]
+  return typeof value === 'number' ? value : 0
 }
 
 // ============================================================================
@@ -265,7 +339,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
   const model = (body.model as string) || 'claude-sonnet-4.5'
   const isStream = body.stream === true
-  logger.info('API', `OpenAI: model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
+  const requestDebugID = createRequestDebugID('oa')
+  const thinkingHeader = detectThinkingHeader(req)
+  logger.info('API', `OpenAI: id=${requestDebugID} model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
 
   // 限流检查
   if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
@@ -284,13 +360,15 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     }
 
     // 转换为 Kiro 格式
-    const thinkingEnabled = isThinkingModel(model) || isThinkingEnabled(Object.fromEntries(req.headers))
+    const thinkingEnabled = isThinkingModel(model) || getThinkingBudgetFromRequest(body.reasoning_effort as string | undefined, body.reasoning as { max_tokens?: number } | undefined) !== undefined
     const kiroPayload = openaiToKiro(body as any, account.profileArn, thinkingEnabled)
+    logger.info('API', `OpenAI request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} reasoningEffort=${(body.reasoning_effort as string | undefined) ?? '-'} reasoningMax=${((body.reasoning as { max_tokens?: number } | undefined)?.max_tokens) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
+    if (settings.debugPayload) logger.info('Payload', `OpenAI id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
 
     if (isStream) {
-      return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled)
+      return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
     } else {
-      return await handleOpenAINonStream(account, kiroPayload, model, thinkingEnabled)
+      return await handleOpenAINonStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
     }
   } catch (e) {
     const err = e as Error
@@ -303,7 +381,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   }
 }
 
-function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Response {
+function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Response {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(controller) {
@@ -337,7 +415,9 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
           handler.finish({
             inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
             cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens,
-            reasoningTokens: usage.reasoningTokens
+            reasoningTokens: usage.reasoningTokens,
+            contextWindowExceeded: usage.contextWindowExceeded,
+            truncated: usage.truncated
           })
           circuitBreaker.recordSuccess()
           accountPool.recordSuccess(account.id, usage.outputTokens)
@@ -352,7 +432,7 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
           } catch { /* ignore */ }
           controller.close()
         },
-        undefined, undefined, thinkingEnabled
+        undefined, undefined, thinkingEnabled, undefined, { requestID: requestDebugID }
       )
     }
   })
@@ -362,13 +442,19 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
   })
 }
 
-async function handleOpenAINonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Promise<Response> {
-  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled)
+async function handleOpenAINonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Promise<Response> {
+  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled, { requestID: requestDebugID })
   circuitBreaker.recordSuccess()
   accountPool.recordSuccess(account.id, result.usage.outputTokens)
   const response = kiroToOpenaiResponse(result.content, result.toolUses, {
-    inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens
-  }, model)
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    cacheReadTokens: result.usage.cacheReadTokens,
+    cacheWriteTokens: result.usage.cacheWriteTokens,
+    reasoningTokens: result.usage.reasoningTokens,
+    contextWindowExceeded: result.usage.contextWindowExceeded,
+    truncated: result.usage.truncated
+  }, model, result.thinkingContent || undefined)
   return Response.json(response)
 }
 
@@ -388,7 +474,9 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
 
   const model = (body.model as string) || 'claude-sonnet-4.5'
   const isStream = body.stream === true
-  logger.info('API', `Claude: model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
+  const requestDebugID = createRequestDebugID('cl')
+  const thinkingHeader = detectThinkingHeader(req)
+  logger.info('API', `Claude: id=${requestDebugID} model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
 
   if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
     return Response.json({ type: 'error', error: { type: 'rate_limit_error', message: 'Rate limit exceeded' } }, { status: 429 })
@@ -403,13 +491,15 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
       return Response.json({ type: 'error', error: { type: 'overloaded_error', message: 'Service temporarily unavailable' } }, { status: 529 })
     }
 
-    const thinkingEnabled = isClaudeThinkingEnabled(body.thinking) || isThinkingModel(model) || isThinkingEnabled(Object.fromEntries(req.headers))
+    const thinkingEnabled = isClaudeThinkingEnabled(body.thinking) || isThinkingModel(model)
     const kiroPayload = claudeToKiro(body as any, account.profileArn, thinkingEnabled)
+    logger.info('API', `Claude request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingBody=${JSON.stringify(body.thinking ?? null)} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
+    if (settings.debugPayload) logger.info('Payload', `Claude id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
 
     if (isStream) {
-      return handleClaudeStream(account, kiroPayload, model, thinkingEnabled)
+      return handleClaudeStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
     } else {
-      return await handleClaudeNonStream(account, kiroPayload, model, thinkingEnabled)
+      return await handleClaudeNonStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
     }
   } catch (e) {
     const err = e as Error
@@ -419,7 +509,7 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
   }
 }
 
-function handleClaudeStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Response {
+function handleClaudeStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Response {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(controller) {
@@ -452,7 +542,10 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
         (usage) => {
           handler.finish({
             inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-            cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens
+            cacheReadTokens: usage.cacheReadTokens,
+            cacheWriteTokens: usage.cacheWriteTokens,
+            contextWindowExceeded: usage.contextWindowExceeded,
+            truncated: usage.truncated
           })
           circuitBreaker.recordSuccess()
           accountPool.recordSuccess(account.id, usage.outputTokens)
@@ -466,7 +559,7 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
           } catch { /* ignore */ }
           controller.close()
         },
-        undefined, undefined, thinkingEnabled
+        undefined, undefined, thinkingEnabled, undefined, { requestID: requestDebugID }
       )
     }
   })
@@ -476,13 +569,18 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
   })
 }
 
-async function handleClaudeNonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Promise<Response> {
-  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled)
+async function handleClaudeNonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Promise<Response> {
+  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled, { requestID: requestDebugID })
   circuitBreaker.recordSuccess()
   accountPool.recordSuccess(account.id, result.usage.outputTokens)
   const response = kiroToClaudeResponse(result.content, result.toolUses, {
-    inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens
-  }, model)
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    cacheReadTokens: result.usage.cacheReadTokens,
+    cacheWriteTokens: result.usage.cacheWriteTokens,
+    contextWindowExceeded: result.usage.contextWindowExceeded,
+    truncated: result.usage.truncated
+  }, model, result.thinkingContent || undefined)
   return Response.json(response)
 }
 
@@ -539,6 +637,9 @@ async function handleAccountsApi(req: Request, path: string): Promise<Response> 
     const account: ProxyAccount = {
       id, email: (body.email as string) || '', accessToken: '',
       refreshToken, region: (body.region as string) || 'us-east-1',
+      authMethod: body.authMethod as ('social' | 'idc' | 'IdC') | undefined,
+      clientId: body.clientId as string,
+      clientSecret: body.clientSecret as string,
       machineId: body.machineId as string, profileArn: body.profileArn as string,
       isAvailable: true, disabled: false, requestCount: 0, errorCount: 0
     }
@@ -577,8 +678,14 @@ async function handleAccountsApi(req: Request, path: string): Promise<Response> 
     if (body.email !== undefined) updates.email = body.email as string
     if (body.region !== undefined) updates.region = body.region as string
     if (body.disabled !== undefined) updates.disabled = body.disabled as boolean
+    if (body.isAvailable !== undefined) updates.isAvailable = body.isAvailable as boolean
+    if (body.quotaExhausted !== undefined) updates.quotaExhausted = body.quotaExhausted as boolean
     if (body.refreshToken !== undefined) updates.refreshToken = body.refreshToken as string
     if (body.machineId !== undefined) updates.machineId = body.machineId as string
+    if (body.authMethod !== undefined) updates.authMethod = body.authMethod as 'social' | 'idc' | 'IdC'
+    if (body.clientId !== undefined) updates.clientId = body.clientId as string
+    if (body.clientSecret !== undefined) updates.clientSecret = body.clientSecret as string
+    if (body.profileArn !== undefined) updates.profileArn = body.profileArn as string
     accountPool.updateAccount(accountId, updates)
     const updated = accountPool.getAccount(accountId)
     if (updated) await storageSetAccount(updated)
@@ -940,6 +1047,14 @@ function addCorsHeaders(response: Response): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 }
 
+function createRequestDebugID(prefix: 'oa' | 'cl'): string {
+  return `${prefix}-${crypto.randomUUID().slice(0, 8)}`
+}
+
+function detectThinkingHeader(req: Request): string {
+  return req.headers.get('anthropic-beta') || req.headers.get('Anthropic-Beta') || ''
+}
+
 // ============================================================================
 // 应用启动
 // ============================================================================
@@ -972,13 +1087,17 @@ async function persistState() {
       totalOutputTokens: metrics.totalOutputTokens,
       startTime: metrics.startTime
     })
-    await saveRequestLogs(metrics.requestLog)
+    await saveRequestLogs(toPersistedRequestLogs(metrics.requestLog))
   } catch (e) {
     logger.error('Persist', `Failed: ${(e as Error).message}`)
   }
 }
 
 async function main() {
+  const level = settings.logLevel.toLowerCase()
+  if (level === 'debug' || level === 'info' || level === 'warn' || level === 'error') {
+    setLogLevel(level)
+  }
   logger.info('Init', `KiroGate v${APP_VERSION} starting...`)
 
   // 初始化存储
@@ -989,17 +1108,21 @@ async function main() {
 
   // 加载持久化的统计数据
   try {
-    const stats = await loadStats()
+    const stats = await loadStats() as PersistedStats | null
     if (stats) {
-      metrics.totalRequests = stats.totalRequests || 0
-      metrics.successRequests = stats.successRequests || 0
-      metrics.errorRequests = stats.errorRequests || 0
-      metrics.streamRequests = stats.streamRequests || 0
-      metrics.nonStreamRequests = stats.nonStreamRequests || 0
-      metrics.totalTokens = stats.totalTokens || 0
+      metrics.totalRequests = readStatNumber(stats, 'totalRequests')
+      metrics.successRequests = readStatNumber(stats, 'successRequests')
+      metrics.errorRequests = readStatNumber(stats, 'errorRequests')
+      metrics.streamRequests = readStatNumber(stats, 'streamRequests')
+      metrics.nonStreamRequests = readStatNumber(stats, 'nonStreamRequests')
+      metrics.totalTokens = readStatNumber(stats, 'totalTokens')
+      metrics.totalInputTokens = readStatNumber(stats, 'totalInputTokens')
+      metrics.totalOutputTokens = readStatNumber(stats, 'totalOutputTokens')
+      const persistedStartTime = readStatNumber(stats, 'startTime')
+      if (persistedStartTime > 0) metrics.startTime = persistedStartTime
     }
     const logs = await loadRequestLogs()
-    if (logs?.length) metrics.requestLog = logs
+    if (logs?.length) metrics.requestLog = fromPersistedRequestLogs(logs)
   } catch { /* ignore */ }
 
   // DNS 预热

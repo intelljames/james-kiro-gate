@@ -10,21 +10,6 @@ import type {
 } from './types.ts'
 import { buildKiroPayload, mapModelIdOrThrow } from './kiroApi.ts'
 
-// ============ Thinking 解析状态机 ============
-export interface ThinkingState {
-  inThinkBlock: boolean
-  thinkBuffer: string
-  pendingStartTagChars: number
-  contentBlockIndex: number
-}
-
-export function createThinkingState(): ThinkingState {
-  return { inThinkBlock: false, thinkBuffer: '', pendingStartTagChars: 0, contentBlockIndex: 0 }
-}
-
-const THINKING_START_TAG = '<thinking>'
-const THINKING_END_TAG = '</thinking>'
-
 // reasoning_effort → budget tokens 映射（兼容 new-api）
 const REASONING_EFFORT_BUDGET: Record<string, number> = { low: 1280, medium: 2048, high: 4096 }
 
@@ -54,6 +39,7 @@ export function isClaudeThinkingEnabled(thinking: unknown): boolean {
   }
   return false
 }
+
 export function getClaudeThinkingType(thinking: unknown): 'enabled' | 'adaptive' | null {
   if (thinking === null || thinking === undefined) return null
   if (typeof thinking === 'object') {
@@ -76,83 +62,6 @@ export function getClaudeThinkingBudget(thinking: unknown): number | undefined {
   return undefined
 }
 
-// 检查缓冲区末尾是否有不完整的标签前缀
-function pendingTagSuffix(buffer: string, tag: string): number {
-  for (let i = 1; i < tag.length; i++) {
-    if (buffer.endsWith(tag.substring(0, i))) return i
-  }
-  return 0
-}
-
-// Thinking 内容解析（流式状态机）
-export function parseThinkingContent(
-  text: string, state: ThinkingState
-): { thinking: string; normalText: string; state: ThinkingState } {
-  let thinking = '', normalText = '', buffer = text
-
-  if (state.pendingStartTagChars > 0) {
-    const remaining = THINKING_START_TAG.substring(state.pendingStartTagChars)
-    if (buffer.startsWith(remaining)) {
-      buffer = buffer.substring(remaining.length)
-      state.inThinkBlock = true; state.pendingStartTagChars = 0
-    } else {
-      normalText += THINKING_START_TAG.substring(0, state.pendingStartTagChars)
-      state.pendingStartTagChars = 0
-    }
-  }
-
-  while (buffer.length > 0) {
-    if (!state.inThinkBlock) {
-      const startIdx = buffer.indexOf(THINKING_START_TAG)
-      if (startIdx === -1) {
-        const pending = pendingTagSuffix(buffer, THINKING_START_TAG)
-        if (pending > 0) {
-          normalText += buffer.substring(0, buffer.length - pending)
-          state.pendingStartTagChars = pending
-        } else { normalText += buffer }
-        break
-      }
-      const beforeTag = buffer.substring(0, startIdx)
-      if (beforeTag.trim().length > 0) normalText += beforeTag
-      buffer = buffer.substring(startIdx + THINKING_START_TAG.length)
-      state.inThinkBlock = true
-    } else {
-      const endIdx = buffer.indexOf(THINKING_END_TAG)
-      if (endIdx === -1) { state.thinkBuffer += buffer; break }
-      thinking += state.thinkBuffer + buffer.substring(0, endIdx)
-      state.thinkBuffer = ''
-      buffer = buffer.substring(endIdx + THINKING_END_TAG.length)
-      state.inThinkBlock = false
-    }
-  }
-  return { thinking, normalText, state }
-}
-
-export function finishThinkingParse(state: ThinkingState): { thinking: string; normalText: string } {
-  let thinking = '', normalText = ''
-  if (state.inThinkBlock && state.thinkBuffer) thinking = state.thinkBuffer
-  if (state.pendingStartTagChars > 0) normalText = THINKING_START_TAG.substring(0, state.pendingStartTagChars)
-  return { thinking, normalText }
-}
-
-// ============ TodoWrite 输入格式转换 ============
-export function transformTodoWriteInput(toolName: string, input: unknown): unknown {
-  if (toolName !== 'TodoWrite' || typeof input !== 'object' || input === null) return input
-  const obj = input as Record<string, unknown>
-  if (!('todos' in obj) || !Array.isArray(obj.todos)) return input
-  const todosArray = obj.todos as Array<{ status?: string; content?: string; activeForm?: string }>
-  const todosStr = todosArray.map((todo, i) => {
-    const status = todo.status || 'pending'
-    const content = todo.content || ''
-    const activeForm = todo.activeForm ? ` (${todo.activeForm})` : ''
-    return `${i + 1}. [${status}] ${content}${activeForm}`
-  }).join('\n')
-  return { ...obj, todos: todosStr }
-}
-
-export function processToolInput(toolName: string, input: unknown): unknown {
-  return transformTodoWriteInput(toolName, input)
-}
 // ============ 会话 ID 管理（简化版） ============
 const conversationMap = new Map<string, string>()
 const CONV_MAP_MAX = 500
@@ -195,7 +104,7 @@ export function openaiToKiro(
   let systemPrompt = ''
   const nonSystemMessages: OpenAIMessage[] = []
   for (const msg of request.messages) {
-    if (msg.role === 'system') {
+    if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') systemPrompt += (systemPrompt ? '\n' : '') + msg.content
       else if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
@@ -382,17 +291,11 @@ function convertOpenAITools(tools?: OpenAITool[]): KiroToolWrapper[] {
 }
 
 // ============ Kiro → OpenAI 响应转换 ============
-export interface OpenAIUsage {
-  prompt_tokens: number; completion_tokens: number; total_tokens: number
-  prompt_tokens_details?: { cached_tokens?: number }
-  completion_tokens_details?: { reasoning_tokens?: number }
-  prompt_cache_hit_tokens?: number
-}
-
 export function kiroToOpenaiResponse(
   content: string, toolUses: KiroToolUse[],
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number },
-  model: string
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; contextWindowExceeded?: boolean; truncated?: boolean },
+  model: string,
+  thinkingContent?: string
 ): OpenAIChatResponse {
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
@@ -404,12 +307,15 @@ export function kiroToOpenaiResponse(
       message: {
         role: 'assistant',
         content: toolUses.length > 0 ? null : content,
+        ...(thinkingContent && { reasoning_content: thinkingContent }),
         tool_calls: toolUses.length > 0 ? toolUses.map(tu => ({
           id: tu.toolUseId, type: 'function' as const,
           function: { name: tu.name, arguments: JSON.stringify(tu.input) }
         })) : undefined
       },
-      finish_reason: toolUses.length > 0 ? 'tool_calls' : 'stop'
+      finish_reason: (usage.truncated || usage.contextWindowExceeded)
+        ? 'length'
+        : (toolUses.length > 0 ? 'tool_calls' : 'stop')
     }],
     usage: {
       prompt_tokens: usage.inputTokens,
@@ -426,20 +332,6 @@ export function kiroToOpenaiResponse(
   }
 }
 
-export function createOpenaiStreamChunk(
-  id: string, model: string,
-  delta: { role?: 'assistant'; content?: string; reasoning_content?: string; tool_calls?: { index: number; id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }[] },
-  finishReason: 'stop' | 'tool_calls' | 'length' | null = null,
-  usage?: OpenAIUsage
-): OpenAIStreamChunk & { usage?: OpenAIUsage } {
-  const chunk: OpenAIStreamChunk & { usage?: OpenAIUsage } = {
-    id, object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, delta: delta as OpenAIStreamChunk['choices'][0]['delta'], finish_reason: finishReason }]
-  }
-  if (usage) chunk.usage = usage
-  return chunk
-}
 // ============ Claude → Kiro 转换 ============
 export function claudeToKiro(
   request: ClaudeRequest, profileArn?: string, thinkingEnabledOverride?: boolean
@@ -593,10 +485,12 @@ function convertClaudeTools(tools?: { name: string; description: string; input_s
 // ============ Kiro → Claude 响应转换 ============
 export function kiroToClaudeResponse(
   content: string, toolUses: KiroToolUse[],
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
-  model: string
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; contextWindowExceeded?: boolean; truncated?: boolean },
+  model: string,
+  thinkingContent?: string
 ): ClaudeResponse {
   const contentBlocks: ClaudeContentBlock[] = []
+  if (thinkingContent) contentBlocks.push({ type: 'thinking', thinking: thinkingContent, signature: '' })
   if (content) contentBlocks.push({ type: 'text', text: content })
   for (const tu of toolUses) {
     contentBlocks.push({ type: 'tool_use', id: tu.toolUseId, name: tu.name, input: tu.input })
@@ -604,7 +498,9 @@ export function kiroToClaudeResponse(
   return {
     id: `msg_${crypto.randomUUID()}`, type: 'message', role: 'assistant',
     content: contentBlocks, model,
-    stop_reason: toolUses.length > 0 ? 'tool_use' : 'end_turn',
+    stop_reason: (usage.truncated || usage.contextWindowExceeded)
+      ? 'max_tokens'
+      : (toolUses.length > 0 ? 'tool_use' : 'end_turn'),
     stop_sequence: null,
     usage: {
       input_tokens: usage.inputTokens, output_tokens: usage.outputTokens,
@@ -638,4 +534,3 @@ export function createClaudeStreamEvent(
       return { type, ...data } as ClaudeStreamEvent
   }
 }
-

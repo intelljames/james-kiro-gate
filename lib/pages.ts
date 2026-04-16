@@ -1,7 +1,7 @@
 // KiroGate 前端页面渲染 - 嵌入式 HTML + Tailwind CSS + ECharts
 // 保持原 KiroGate 风格，新增账号管理、API Key 管理等页面
 
-const PROXY_BASE = "https://proxy.jhun.edu.kg"
+const PROXY_BASE = ""
 
 export function getPageConfig(version: string) {
   return { version, proxyBase: PROXY_BASE }
@@ -17,9 +17,9 @@ export function commonHead(version: string): string {
   <title>KiroGate - OpenAI & Anthropic 兼容的 Kiro API 代理网关</title>
   <meta name="description" content="KiroGate 是一个开源的 Kiro IDE API 代理网关，支持 OpenAI 和 Anthropic API 格式。">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>">
-  <script src="${PROXY_BASE}/proxy/cdn.tailwindcss.com"></script>
-  <script src="${PROXY_BASE}/proxy/cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-  <script src="${PROXY_BASE}/proxy/cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <style>
     :root { --primary: #6366f1; --primary-dark: #4f46e5; }
     [data-theme="light"] { --bg-main:#fff;--bg-card:#f8fafc;--bg-nav:#fff;--bg-input:#fff;--text:#0f172a;--text-muted:#64748b;--border:#e2e8f0;--border-dark:#cbd5e1; }
@@ -394,7 +394,7 @@ export function generateOpenAPISpec(version: string): Record<string, unknown> {
 }
 
 export function renderSwaggerPage(version: string): string {
-  return `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>KiroGate - Swagger</title><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>"><link rel="stylesheet" href="${PROXY_BASE}/proxy/unpkg.com/swagger-ui-dist@5/swagger-ui.css"><style>body{margin:0;background:#fafafa}.swagger-ui .topbar{display:none}.hdr{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}.hdr h1{margin:0;font-size:1.5rem}.hdr a{color:#fff;text-decoration:none;opacity:.8;margin-left:1.5rem}.hdr a:hover{opacity:1}.badge{background:rgba(255,255,255,.2);padding:.25rem .5rem;border-radius:.25rem;font-size:.8rem;margin-left:1rem}</style></head><body><div class="hdr"><div style="display:flex;align-items:center"><h1>⚡ KiroGate API</h1><span class="badge">v${version}</span></div><nav><a href="/">首页</a><a href="/docs">文档</a><a href="/playground">Playground</a><a href="https://github.com/dext7r/KiroGate" target="_blank">GitHub</a></nav></div><div id="swagger-ui"></div><script src="${PROXY_BASE}/proxy/unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>window.onload=function(){SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui",deepLinking:true,presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset],layout:"BaseLayout",docExpansion:"list",filter:true})}</script></body></html>`
+  return `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>KiroGate - Swagger</title><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"><style>body{margin:0;background:#fafafa}.swagger-ui .topbar{display:none}.hdr{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}.hdr h1{margin:0;font-size:1.5rem}.hdr a{color:#fff;text-decoration:none;opacity:.8;margin-left:1.5rem}.hdr a:hover{opacity:1}.badge{background:rgba(255,255,255,.2);padding:.25rem .5rem;border-radius:.25rem;font-size:.8rem;margin-left:1rem}</style></head><body><div class="hdr"><div style="display:flex;align-items:center"><h1>⚡ KiroGate API</h1><span class="badge">v${version}</span></div><nav><a href="/">首页</a><a href="/docs">文档</a><a href="/playground">Playground</a><a href="https://github.com/dext7r/KiroGate" target="_blank">GitHub</a></nav></div><div id="swagger-ui"></div><script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>window.onload=function(){SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui",deepLinking:true,presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset],layout:"BaseLayout",docExpansion:"list",filter:true})}</script></body></html>`
 }
 
 // ============================================================================

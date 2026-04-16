@@ -9,11 +9,6 @@ const THINKING_END_TAG = '</thinking>'
 const MAX_THINKING_CHARS = 100000
 const MAX_RESPONSE_BUFFER_CHARS = 2 * 1024 * 1024
 const MAX_TOOL_INPUT_BUFFER_CHARS = 1024 * 1024
-const MICRO_BUFFER_SIZE = 1024
-const MICRO_BUFFER_DELAY_MS = 16
-const PING_INTERVAL_MS = 25000
-const CONNECTION_TIMEOUT_MS = 300000
-const CLEANUP_INTERVAL_MS = 60000
 
 // 引号字符集（用于跳过被引用的 thinking 标签）
 const QUOTE_CHARS = new Set(['`', '"', "'", '\\', '#', '!', '@', '$', '%', '^', '&', '*', '(', ')', '-', '_', '=', '+', '[', ']', '{', '}', ';', ':', '<', '>', ',', '.', '?', '/'])
@@ -37,140 +32,6 @@ export function countTokens(text: string): number {
   return Math.max(1, Math.round(tokens))
 }
 
-// ============ SSE 连接管理器 ============
-interface SSEConnection {
-  id: string; startTime: number; lastActivityTime: number
-  lastPingTime: number; pingCount: number; isAlive: boolean
-  onPing: () => void; onClose: () => void
-}
-
-class SSEConnectionManager {
-  private connections = new Map<string, SSEConnection>()
-  private pingIntervals = new Map<string, number>()
-  private cleanupTimer: number | null = null
-
-  constructor() { this.startCleanupTimer() }
-
-  register(connectionId: string, onPing: () => void, onClose: () => void): SSEConnection {
-    const now = Date.now()
-    const connection: SSEConnection = {
-      id: connectionId, startTime: now, lastActivityTime: now,
-      lastPingTime: now, pingCount: 0, isAlive: true, onPing, onClose
-    }
-    this.connections.set(connectionId, connection)
-    const pingInterval = setInterval(() => this.sendPing(connectionId), PING_INTERVAL_MS) as unknown as number
-    this.pingIntervals.set(connectionId, pingInterval)
-    return connection
-  }
-
-  private sendPing(connectionId: string): void {
-    const conn = this.connections.get(connectionId)
-    if (!conn || !conn.isAlive) { this.unregister(connectionId); return }
-    try { conn.onPing(); conn.lastPingTime = Date.now(); conn.pingCount++ }
-    catch { conn.isAlive = false; this.unregister(connectionId) }
-  }
-
-  recordActivity(connectionId: string): void {
-    const conn = this.connections.get(connectionId)
-    if (conn) conn.lastActivityTime = Date.now()
-  }
-
-  markClosed(connectionId: string): void {
-    const conn = this.connections.get(connectionId)
-    if (conn) conn.isAlive = false
-    this.unregister(connectionId)
-  }
-
-  unregister(connectionId: string): void {
-    const interval = this.pingIntervals.get(connectionId)
-    if (interval) { clearInterval(interval); this.pingIntervals.delete(connectionId) }
-    const conn = this.connections.get(connectionId)
-    if (conn) { try { conn.onClose() } catch { /* ignore */ } }
-    this.connections.delete(connectionId)
-  }
-
-  private startCleanupTimer(): void {
-    if (this.cleanupTimer) return
-    this.cleanupTimer = setInterval(() => this.cleanupStale(), CLEANUP_INTERVAL_MS) as unknown as number
-  }
-
-  private cleanupStale(): void {
-    const now = Date.now()
-    for (const [id, conn] of this.connections) {
-      if (now - conn.lastActivityTime > CONNECTION_TIMEOUT_MS) {
-        conn.isAlive = false; this.unregister(id)
-      }
-    }
-  }
-
-  getStats(): { activeConnections: number; totalPings: number } {
-    let totalPings = 0
-    for (const conn of this.connections.values()) totalPings += conn.pingCount
-    return { activeConnections: this.connections.size, totalPings }
-  }
-
-  isAlive(connectionId: string): boolean {
-    return this.connections.get(connectionId)?.isAlive ?? false
-  }
-}
-
-export const sseConnectionManager = new SSEConnectionManager()
-
-// ============ SSE 保活包装器 ============
-export function generateConnectionId(): string {
-  return `sse-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`
-}
-
-export function createKeepAliveSSEWriter(
-  connectionId: string,
-  writer: { write: (data: string) => void | Promise<void>; end?: () => void | Promise<void> },
-  options?: { pingEvent?: string }
-): { write: (data: string) => void; end: () => void; recordActivity: () => void } {
-  const pingEvent = options?.pingEvent || 'event: ping\ndata: {"type":"ping"}\n\n'
-  const connection = sseConnectionManager.register(
-    connectionId,
-    () => { try { writer.write(pingEvent) } catch { sseConnectionManager.markClosed(connectionId) } },
-    () => { try { writer.end?.() } catch { /* ignore */ } }
-  )
-  return {
-    write: (data: string) => {
-      if (!connection.isAlive) throw new Error('Connection closed')
-      writer.write(data); sseConnectionManager.recordActivity(connectionId)
-    },
-    end: () => { sseConnectionManager.markClosed(connectionId) },
-    recordActivity: () => { sseConnectionManager.recordActivity(connectionId) }
-  }
-}
-
-export function formatSSEEvent(eventType: string, data: unknown): string {
-  return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`
-}
-
-export function formatSSEPing(): string { return 'event: ping\ndata: {"type":"ping"}\n\n' }
-
-// ============ SSE 状态管理器 ============
-export type SSEState = 'initial' | 'message_started' | 'content_block' | 'message_ended'
-
-export class SSEStateManager {
-  private state: SSEState = 'initial'
-  private contentBlockOpen = false
-  private contentBlockIdx = -1
-
-  canSendMessageStart(): boolean { return this.state === 'initial' }
-  canSendContentBlockStart(): boolean { return this.state === 'message_started' && !this.contentBlockOpen }
-  canSendContentBlockDelta(): boolean { return this.state === 'message_started' && this.contentBlockOpen }
-  canSendContentBlockStop(): boolean { return this.state === 'message_started' && this.contentBlockOpen }
-  canSendMessageDelta(): boolean { return this.state === 'message_started' && !this.contentBlockOpen }
-  canSendMessageStop(): boolean { return this.state === 'message_started' }
-
-  onMessageStart() { this.state = 'message_started' }
-  onContentBlockStart() { this.contentBlockOpen = true; this.contentBlockIdx++ }
-  onContentBlockStop() { this.contentBlockOpen = false }
-  onMessageStop() { this.state = 'message_ended' }
-  getCurrentIndex(): number { return this.contentBlockIdx }
-  isContentBlockOpen(): boolean { return this.contentBlockOpen }
-  getState(): SSEState { return this.state }
-}
 // ============ Thinking 标签检测 ============
 function isPrecededByQuoteChar(buffer: string, pos: number): boolean {
   if (pos <= 0) return false
@@ -332,27 +193,19 @@ export class ThinkingBufferParser {
   reset(): void { this.buffer = ''; this.inThinkBlock = false; this.pendingStartTagChars = 0; this.thinkingLength = 0; this.overflowWarned = false }
 }
 
-// ============ 输出缓冲器 ============
-export class OutputBuffer {
-  private flushCallback: (content: string) => void
-  private buffer = ''
-  private timer: ReturnType<typeof setTimeout> | null = null
+// ============ SSE 状态管理器（ClaudeStreamHandler 内部使用）============
+class SSEStateManager {
+  private state: 'initial' | 'message_started' | 'message_ended' = 'initial'
+  private contentBlockOpen = false
+  private contentBlockIdx = -1
 
-  constructor(onFlush: (content: string) => void) { this.flushCallback = onFlush }
-
-  add(content: string): void {
-    if (!content) return
-    this.buffer += content
-    if (this.buffer.length >= MICRO_BUFFER_SIZE) { this.flush(); return }
-    if (!this.timer) this.timer = setTimeout(() => { this.timer = null; this.flush() }, MICRO_BUFFER_DELAY_MS)
-  }
-
-  flush(): void {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null }
-    if (this.buffer) { this.flushCallback(this.buffer); this.buffer = '' }
-  }
-
-  getBuffer(): string { return this.buffer }
+  onMessageStart() { this.state = 'message_started' }
+  onContentBlockStart() { this.contentBlockOpen = true; this.contentBlockIdx++ }
+  onContentBlockStop() { this.contentBlockOpen = false }
+  onMessageStop() { this.state = 'message_ended' }
+  getCurrentIndex(): number { return this.contentBlockIdx }
+  isContentBlockOpen(): boolean { return this.contentBlockOpen }
+  canSendMessageStart(): boolean { return this.state === 'initial' }
 }
 
 // ============ SSE 事件构建器 ============
@@ -560,7 +413,7 @@ export class ClaudeStreamHandler {
     this.closeCurrentBlock(); this.currentToolUse = null
   }
 
-  finish(usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void {
+  finish(usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; truncated?: boolean; contextWindowExceeded?: boolean }): void {
     if (this.responseEnded) return
     this.responseEnded = true
     if (this.enableThinkingParsing) {
@@ -570,7 +423,9 @@ export class ClaudeStreamHandler {
       }
     }
     this.closeCurrentBlock()
-    const stopReason = this.stopReasonOverride || (this.toolCalls.length > 0 ? 'tool_use' : 'end_turn')
+    const stopReason = this.stopReasonOverride || (((usage as { truncated?: boolean; contextWindowExceeded?: boolean }).truncated || (usage as { truncated?: boolean; contextWindowExceeded?: boolean }).contextWindowExceeded)
+      ? 'max_tokens'
+      : (this.toolCalls.length > 0 ? 'tool_use' : 'end_turn'))
     const finalOutputTokens = this.outputTokens > 0 ? this.outputTokens : countTokens(this.responseBuffer.join(''))
     this.onWrite(claudeSSE.messageDelta(stopReason, finalOutputTokens, usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens))
     this.onWrite(claudeSSE.messageStop()); this.stateManager.onMessageStop()
@@ -707,7 +562,7 @@ export class OpenAIStreamHandler {
     this.toolCallIndex++; this.currentToolCall = null
   }
 
-  finish(usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }): void {
+  finish(usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; truncated?: boolean; contextWindowExceeded?: boolean }): void {
     if (this.responseEnded) return
     this.responseEnded = true
     if (this.enableThinkingParsing) {
@@ -716,7 +571,9 @@ export class OpenAIStreamHandler {
         else this.emitContent(item.content)
       }
     }
-    const finishReason = this.stopReasonOverride || (this.toolCalls.length > 0 ? 'tool_calls' : 'stop')
+    const finishReason = this.stopReasonOverride || ((usage.truncated || usage.contextWindowExceeded)
+      ? 'length'
+      : (this.toolCalls.length > 0 ? 'tool_calls' : 'stop'))
     const finalOutputTokens = this.outputTokens > 0 ? this.outputTokens : countTokens(this.responseBuffer.join(''))
     const reasoningTokens = usage.reasoningTokens || (this.thinkingBuffer.length > 0 ? countTokens(this.thinkingBuffer.join('')) : 0)
     const usageInfo: Record<string, unknown> = {

@@ -19,6 +19,64 @@ const KIRO_CLI_AMZ_USER_AGENT = 'aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os
 export const DEFAULT_THINKING_BUDGET = 200000
 export const MAX_THINKING_BUDGET = 200000
 
+type StreamUsage = {
+  inputTokens: number
+  outputTokens: number
+  credits: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
+  contextWindowExceeded?: boolean
+  truncated?: boolean
+}
+
+type StreamDebugInfo = {
+  requestID?: string
+  endpointName?: string
+  modelId?: string
+  payloadBytes?: number
+  historyCount?: number
+  toolCount?: number
+  thinkingEnabled?: boolean
+  hasReasoningConfig?: boolean
+  reasoningBudget?: number
+}
+
+function previewText(value: string | undefined, limit = 800): string {
+  if (!value) return ''
+  return value.length > limit ? `${value.slice(0, limit)} ...[truncated ${value.length - limit} chars]` : value
+}
+
+export function summarizeKiroPayload(payload: KiroPayload): Record<string, unknown> {
+  const current = payload.conversationState.currentMessage.userInputMessage
+  const history = payload.conversationState.history || []
+  return {
+    conversationId: payload.conversationState.conversationId,
+    agentTaskType: payload.conversationState.agentTaskType,
+    current: {
+      modelId: current.modelId,
+      origin: current.origin,
+      contentLength: current.content.length,
+      contentPreview: previewText(current.content),
+      imageCount: current.images?.length || 0,
+      toolCount: current.userInputMessageContext?.tools?.length || 0,
+      toolResultCount: current.userInputMessageContext?.toolResults?.length || 0,
+      toolNames: current.userInputMessageContext?.tools?.map((t) => t.toolSpecification.name).slice(0, 20) || [],
+    },
+    historyCount: history.length,
+    historyPreview: history.slice(-6).map((item, index) => ({
+      index: history.length - Math.min(history.length, 6) + index,
+      role: item.userInputMessage ? 'user' : 'assistant',
+      contentLength: item.userInputMessage?.content?.length || item.assistantResponseMessage?.content?.length || 0,
+      contentPreview: previewText(item.userInputMessage?.content || item.assistantResponseMessage?.content),
+      toolCount: item.userInputMessage?.userInputMessageContext?.tools?.length || item.assistantResponseMessage?.toolUses?.length || 0,
+      toolResultCount: item.userInputMessage?.userInputMessageContext?.toolResults?.length || 0,
+    })),
+    inferenceConfig: payload.inferenceConfig,
+    profileArnPresent: !!payload.profileArn,
+  }
+}
+
 const KIRO_ENDPOINTS = [
   {
     url: `https://codewhisperer.${KIRO_API_REGION}.amazonaws.com/generateAssistantResponse`,
@@ -217,26 +275,6 @@ export function mapModelIdOrThrow(model: string): string {
 
 export function isModelAvailable(model: string): boolean { return mapModelId(model) !== null }
 
-export function getModelRateMultiplier(modelId: string): { rateMultiplier: number; rateUnit: string } {
-  const normalized = normalizeModelId(modelId)
-  if (cachedKiroModels.length > 0) {
-    const model = cachedKiroModels.find(m => m.modelId.toLowerCase() === normalized || m.modelId.toLowerCase() === modelId.toLowerCase())
-    if (model?.rateMultiplier !== undefined) return { rateMultiplier: model.rateMultiplier, rateUnit: model.rateUnit || 'credit' }
-  }
-  const lower = modelId.toLowerCase()
-  if (lower.includes('opus')) return { rateMultiplier: 5.0, rateUnit: 'credit' }
-  if (lower.includes('haiku')) return { rateMultiplier: 0.2, rateUnit: 'credit' }
-  return { rateMultiplier: 1.0, rateUnit: 'credit' }
-}
-
-export function isAgenticRequest(model: string, tools?: unknown[]): boolean {
-  return model.toLowerCase().includes('agentic') || Boolean(tools && tools.length > 0)
-}
-
-export function isThinkingEnabled(headers?: Record<string, string>): boolean {
-  if (!headers) return false
-  return (headers['anthropic-beta'] || headers['Anthropic-Beta'] || '').toLowerCase().includes('thinking')
-}
 // ============ Agentic 系统提示 ============
 const AGENTIC_SYSTEM_PROMPT = `File operations limit: max 600 lines per write. For larger files, use chunked writes (400-500 lines each). Use Edit for modifications instead of full rewrites.
 When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.`
@@ -615,10 +653,11 @@ function calculateRetryDelayMs(attempt: number): number {
 export async function callKiroApiStream(
   account: ProxyAccount, payload: KiroPayload,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, toolUseStream?: KiroToolUseStream) => void,
-  onComplete: (usage: { inputTokens: number; outputTokens: number; credits: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; contextWindowExceeded?: boolean }) => void,
+  onComplete: (usage: StreamUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal, preferredEndpoint?: 'codewhisperer' | 'amazonq',
-  thinkingEnabled?: boolean, streamReadTimeout?: number
+  thinkingEnabled?: boolean, streamReadTimeout?: number,
+  debugInfo?: StreamDebugInfo
 ): Promise<void> {
   const endpoints = getSortedEndpoints(preferredEndpoint)
   let lastError: Error | null = null
@@ -640,6 +679,19 @@ export async function callKiroApiStream(
         }
         const payloadStr = JSON.stringify(payload)
         logger.info('KiroAPI', `${endpoint.name}${retry > 0 ? ` retry=${retry}` : ''} payload=${Math.round(payloadStr.length/1024)}KB`)
+
+        const requestDebugInfo: StreamDebugInfo = {
+          ...debugInfo,
+          endpointName: endpoint.name,
+          payloadBytes: payloadStr.length,
+          historyCount: payload.conversationState.history?.length || 0,
+          toolCount: payload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0,
+          thinkingEnabled: thinkingEnabled === true,
+          hasReasoningConfig: !!payload.inferenceConfig?.reasoningConfig,
+          reasoningBudget: payload.inferenceConfig?.reasoningConfig?.budgetTokens,
+          modelId: payload.conversationState.currentMessage.userInputMessage?.modelId
+        }
+        logger.info('KiroAPI', `Request debug requestID=${requestDebugInfo.requestID || '-'} endpoint=${requestDebugInfo.endpointName} model=${requestDebugInfo.modelId || '-'} history=${requestDebugInfo.historyCount} tools=${requestDebugInfo.toolCount} thinking=${requestDebugInfo.thinkingEnabled} reasoning=${requestDebugInfo.hasReasoningConfig ? (requestDebugInfo.reasoningBudget || 'on') : 'off'} payloadBytes=${requestDebugInfo.payloadBytes}`)
 
         const headers = await getAuthHeaders(account, endpoint)
         const requestStartTime = Date.now()
@@ -691,7 +743,7 @@ export async function callKiroApiStream(
         const connectLatency = Date.now() - requestStartTime
         logger.info('KiroAPI', `Connected to ${endpoint.name} in ${connectLatency}ms`)
         recordEndpointSuccess(endpoint.name, connectLatency)
-        await parseEventStream(response.body!, onChunk, onComplete, onError, payloadStr, thinkingEnabled, streamReadTimeout)
+        await parseEventStream(response.body!, onChunk, onComplete, onError, payloadStr, thinkingEnabled, streamReadTimeout, requestDebugInfo)
         return
       } catch (error) {
         lastError = error as Error; recordEndpointFailure(endpoint.name)
@@ -870,15 +922,16 @@ function countTokens(text: string): number {
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, toolUseStream?: KiroToolUseStream) => void,
-  onComplete: (usage: { inputTokens: number; outputTokens: number; credits: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; contextWindowExceeded?: boolean }) => void,
+  onComplete: (usage: StreamUsage) => void,
   onError: (error: Error) => void,
-  inputPayload = '', thinkingEnabled = false, streamReadTimeout = 120000
+  inputPayload = '', thinkingEnabled = false, streamReadTimeout = 120000,
+  debugInfo?: StreamDebugInfo
 ): Promise<void> {
   const reader = body.getReader()
   let buffer = new Uint8Array(64 * 1024)
   let bufferUsed = 0
   const textDecoder = new TextDecoder()
-  const usage = { inputTokens: 0, outputTokens: 0, credits: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, contextWindowExceeded: false }
+  const usage: StreamUsage = { inputTokens: 0, outputTokens: 0, credits: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, contextWindowExceeded: false, truncated: false }
   let totalOutputText = ''
   const MAX_OUTPUT_TEXT = 4 * 1024 * 1024
   let outputOverflowed = false
@@ -888,15 +941,16 @@ async function parseEventStream(
   const processedIds = new Set<string>()
   const thinkingState: ThinkingParserState = { inThinking: false, buffer: '', thinkingLength: 0 }
   const READ_TIMEOUT = streamReadTimeout
-  let lastReadTime = Date.now()
-  let isCompleted = false
   const MAX_DECODE_ERRORS = 5
   let consecutiveDecodeErrors = 0
+  let sawMeteringEvent = false
+  let sawContextUsageEvent = false
+  let lastEventType = ''
 
   async function readWithTimeout(): Promise<ReadableStreamReadResult<Uint8Array>> {
     return new Promise((resolve, reject) => {
       const tid = setTimeout(() => reject(new Error(`Stream read timeout: ${READ_TIMEOUT / 1000}s`)), READ_TIMEOUT)
-      reader.read().then(r => { clearTimeout(tid); lastReadTime = Date.now(); resolve(r) }).catch(e => { clearTimeout(tid); reject(e) })
+      reader.read().then(r => { clearTimeout(tid); resolve(r) }).catch(e => { clearTimeout(tid); reject(e) })
     })
   }
 
@@ -935,6 +989,7 @@ async function parseEventStream(
           try {
             const payloadText = textDecoder.decode(payloadBytes)
             const event = JSON.parse(payloadText)
+            lastEventType = eventType || (event._type as string) || (event.type as string) || lastEventType
             // assistantResponseEvent - 文本内容
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const content = (event.assistantResponseEvent || event).content
@@ -970,40 +1025,17 @@ async function parseEventStream(
                 }
               }
             }
-            // messageMetadataEvent - token 使用量
-            if (eventType === 'messageMetadataEvent' || eventType === 'metadataEvent' || event.messageMetadataEvent || event.metadataEvent) {
-              const md = event.messageMetadataEvent || event.metadataEvent || event
-              if (md.tokenUsage) {
-                const tu = md.tokenUsage
-                const uncached = tu.uncachedInputTokens || 0, cRead = tu.cacheReadInputTokens || 0, cWrite = tu.cacheWriteInputTokens || 0
-                const calcInput = uncached + cRead + cWrite
-                if (calcInput > 0) usage.inputTokens = calcInput
-                if (tu.outputTokens) usage.outputTokens = tu.outputTokens
-                if (tu.totalTokens && usage.inputTokens === 0 && usage.outputTokens > 0) usage.inputTokens = tu.totalTokens - usage.outputTokens
-                usage.cacheReadTokens = cRead; usage.cacheWriteTokens = cWrite
-              }
-              if (md.inputTokens) usage.inputTokens = md.inputTokens
-              if (md.outputTokens) usage.outputTokens = md.outputTokens
-            }
             // meteringEvent - credit 使用量
             if (eventType === 'meteringEvent' || event.meteringEvent) {
               const m = event.meteringEvent || event
+              sawMeteringEvent = true
               if (m.usage && typeof m.usage === 'number') usage.credits += m.usage
             }
             // contextUsageEvent
             if (eventType === 'contextUsageEvent' || event.contextUsageEvent) {
               const cu = (event.contextUsageEvent || event).contextUsagePercentage
+              sawContextUsageEvent = true
               if (cu !== undefined && cu >= 100) usage.contextWindowExceeded = true
-            }
-            // reasoningContentEvent - Thinking 推理内容
-            if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
-              const r = event.reasoningContentEvent || event
-              if (r.text && thinkingEnabled) {
-                onChunk(r.text, undefined, true)
-                if (!outputOverflowed && totalOutputText.length + r.text.length <= MAX_OUTPUT_TEXT) totalOutputText += r.text
-                else if (!outputOverflowed) outputOverflowed = true
-                usage.reasoningTokens += countTokens(r.text)
-              }
             }
             // supplementaryWebLinksEvent
             if (eventType === 'supplementaryWebLinksEvent' || event.supplementaryWebLinksEvent) {
@@ -1017,6 +1049,8 @@ async function parseEventStream(
             if (eventType === 'exceptionEvent' || event.exceptionEvent) {
               const ex = event.exceptionEvent || event
               if ((ex.exceptionType || ex.type) === 'ContentLengthExceededException') {
+                usage.contextWindowExceeded = true
+                usage.truncated = true
                 onChunk('', { toolUseId: '__content_length_exceeded__', name: '__exception__', input: { type: 'ContentLengthExceededException', message: ex.message || '' } })
               }
             }
@@ -1046,7 +1080,14 @@ async function parseEventStream(
     toolBuffers.clear()
     if (thinkingState.buffer) { onChunk(thinkingState.buffer, undefined, thinkingState.inThinking && thinkingEnabled); thinkingState.buffer = '' }
     if (usage.outputTokens === 0 && totalOutputText) usage.outputTokens = countTokens(totalOutputText)
-    isCompleted = true; onComplete(usage)
+    const sawResponsePayload = totalOutputText.length > 0 || processedIds.size > 0
+    const streamCompletedNormally = sawMeteringEvent
+    if (!usage.truncated && !streamCompletedNormally && sawResponsePayload) {
+      usage.truncated = true
+      logger.warn('KiroAPI', `Stream ended without terminal metadata; marking response as truncated (${Math.round(totalOutputText.length / 1024)}KB text, contextUsage=${sawContextUsageEvent})`)
+    }
+    logger.info('KiroAPI', `Stream summary requestID=${debugInfo?.requestID || '-'} endpoint=${debugInfo?.endpointName || '-'} model=${debugInfo?.modelId || '-'} done=${streamCompletedNormally} truncated=${usage.truncated === true} contextExceeded=${usage.contextWindowExceeded === true} metering=${sawMeteringEvent} contextUsage=${sawContextUsageEvent} outputTokens=${usage.outputTokens} outputChars=${totalOutputText.length} tools=${processedIds.size} lastEvent=${lastEventType || '-'} thinking=${thinkingEnabled}`)
+    onComplete(usage)
   } catch (error) { onError(error as Error) }
   finally { reader.releaseLock() }
 }
@@ -1054,14 +1095,21 @@ async function parseEventStream(
 // ============ 非流式调用 ============
 export async function callKiroApi(
   account: ProxyAccount, payload: KiroPayload,
-  signal?: AbortSignal, preferredEndpoint?: 'codewhisperer' | 'amazonq', thinkingEnabled = false
-): Promise<{ content: string; toolUses: KiroToolUse[]; usage: { inputTokens: number; outputTokens: number; credits: number } }> {
+  signal?: AbortSignal, preferredEndpoint?: 'codewhisperer' | 'amazonq', thinkingEnabled = false,
+  debugInfo?: StreamDebugInfo
+): Promise<{ content: string; toolUses: KiroToolUse[]; usage: StreamUsage; thinkingContent: string }> {
   return new Promise((resolve, reject) => {
-    let content = ''; const toolUses: KiroToolUse[] = []; let usage = { inputTokens: 0, outputTokens: 0, credits: 0 }
+    let content = ''; let thinkingContent = ''; const toolUses: KiroToolUse[] = []; let usage: StreamUsage = { inputTokens: 0, outputTokens: 0, credits: 0 }
     callKiroApiStream(account, payload,
-      (text, toolUse) => { content += text; if (toolUse) toolUses.push(toolUse) },
-      (u) => { usage = u; resolve({ content, toolUses, usage }) },
-      reject, signal, preferredEndpoint, thinkingEnabled
+      (text, toolUse, isThinking) => {
+        if (isThinking) { thinkingContent += text; return }
+        content += text
+        if (!toolUse) return
+        if (toolUse.toolUseId === '__content_length_exceeded__' || toolUse.name === '__exception__') return
+        toolUses.push(toolUse)
+      },
+      (u) => { usage = u; resolve({ content, toolUses, usage, thinkingContent }) },
+      reject, signal, preferredEndpoint, thinkingEnabled, undefined, debugInfo
     )
   })
 }
@@ -1070,14 +1118,6 @@ export async function callKiroApi(
 function getQServiceEndpoint(region?: string): string {
   if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
   return 'https://q.us-east-1.amazonaws.com'
-}
-function getCodeWhispererEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
-  return 'https://codewhisperer.us-east-1.amazonaws.com'
-}
-function getFallbackCodeWhispererEndpoint(region?: string): string {
-  const primary = getCodeWhispererEndpoint(region)
-  return primary.includes('eu-central-1') ? 'https://codewhisperer.us-east-1.amazonaws.com' : 'https://codewhisperer.eu-central-1.amazonaws.com'
 }
 
 // ============ 获取模型列表 ============
@@ -1112,45 +1152,3 @@ export async function fetchKiroModels(account: ProxyAccount): Promise<KiroModel[
   }
 }
 
-// ============ 订阅 API ============
-export interface SubscriptionPlan {
-  name: string; qSubscriptionType: string
-  description: { title: string; billingInterval: string; featureHeader: string; features: string[] }
-  pricing: { amount: number; currency: string }
-}
-export interface SubscriptionListResponse { disclaimer?: string[]; subscriptionPlans?: SubscriptionPlan[] }
-export interface SubscriptionTokenResponse { encodedVerificationUrl?: string; status?: string; token?: string | null; message?: string }
-
-export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
-  const primaryBase = getCodeWhispererEndpoint(account.region)
-  const fallbackBase = getFallbackCodeWhispererEndpoint(account.region)
-  const { userAgent, amzUserAgent } = await buildUserAgent(account)
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json',
-    'User-Agent': userAgent, 'x-amz-user-agent': amzUserAgent, 'x-amzn-codewhisperer-optout-preference': 'OPTIN'
-  }
-  try {
-    let resp = await fetch(`${primaryBase}/listAvailableSubscriptions`, { method: 'POST', headers, body: '{}' })
-    if (resp.status === 403) resp = await fetch(`${fallbackBase}/listAvailableSubscriptions`, { method: 'POST', headers, body: '{}' })
-    if (!resp.ok) return {}
-    return await resp.json()
-  } catch { return {} }
-}
-
-export async function fetchSubscriptionToken(account: ProxyAccount, subscriptionType?: string): Promise<SubscriptionTokenResponse> {
-  const primaryBase = getCodeWhispererEndpoint(account.region)
-  const fallbackBase = getFallbackCodeWhispererEndpoint(account.region)
-  const { userAgent, amzUserAgent } = await buildUserAgent(account)
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json',
-    'User-Agent': userAgent, 'x-amz-user-agent': amzUserAgent, 'x-amzn-codewhisperer-optout-preference': 'OPTIN'
-  }
-  const body: { provider: string; clientToken: string; subscriptionType?: string } = { provider: 'STRIPE', clientToken: uuidv4() }
-  if (subscriptionType) body.subscriptionType = subscriptionType
-  try {
-    let resp = await fetch(`${primaryBase}/CreateSubscriptionToken`, { method: 'POST', headers, body: JSON.stringify(body) })
-    if (resp.status === 403) resp = await fetch(`${fallbackBase}/CreateSubscriptionToken`, { method: 'POST', headers, body: JSON.stringify(body) })
-    if (!resp.ok) { const e = await resp.json().catch(() => ({})); return { message: e.message || `Failed: ${resp.status}` } }
-    return await resp.json()
-  } catch (e) { return { message: e instanceof Error ? e.message : 'Unknown error' } }
-}
