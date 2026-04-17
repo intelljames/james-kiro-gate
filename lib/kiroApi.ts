@@ -1083,8 +1083,13 @@ async function parseEventStream(
     const sawResponsePayload = totalOutputText.length > 0 || processedIds.size > 0
     const streamCompletedNormally = sawMeteringEvent
     if (!usage.truncated && !streamCompletedNormally && sawResponsePayload) {
-      usage.truncated = true
-      logger.warn('KiroAPI', `Stream ended without terminal metadata; marking response as truncated (${Math.round(totalOutputText.length / 1024)}KB text, contextUsage=${sawContextUsageEvent})`)
+      const hasToolCalls = processedIds.size > 0
+      if (!hasToolCalls) {
+        usage.truncated = true
+        logger.warn('KiroAPI', `Stream ended without meteringEvent; marking as truncated (${Math.round(totalOutputText.length / 1024)}KB text)`)
+      } else {
+        logger.debug('KiroAPI', `Stream ended without meteringEvent but has tool calls; not marking as truncated`)
+      }
     }
     logger.info('KiroAPI', `Stream summary requestID=${debugInfo?.requestID || '-'} endpoint=${debugInfo?.endpointName || '-'} model=${debugInfo?.modelId || '-'} done=${streamCompletedNormally} truncated=${usage.truncated === true} contextExceeded=${usage.contextWindowExceeded === true} metering=${sawMeteringEvent} contextUsage=${sawContextUsageEvent} outputTokens=${usage.outputTokens} outputChars=${totalOutputText.length} tools=${processedIds.size} lastEvent=${lastEventType || '-'} thinking=${thinkingEnabled}`)
     onComplete(usage)

@@ -166,7 +166,9 @@ export function openaiToKiro(
       }
       const nextMsg = nonSystemMessages[i + 1]
       const shouldFlush = !nextMsg || nextMsg.role !== 'tool'
-      if (shouldFlush && toolResults.length > 0 && !isLast) {
+      // 修复：移除 !isLast 条件，确保 tool results 总是被添加到 history 中
+      // 这样 Kiro API 才能正确地将 tool result 与之前的 tool call 关联
+      if (shouldFlush && toolResults.length > 0) {
         history.push({ userInputMessage: {
           content: 'Tool results provided.', modelId, origin,
           userInputMessageContext: { toolResults: [...toolResults] }
@@ -190,8 +192,16 @@ export function openaiToKiro(
 
   const kiroTools = convertOpenAITools(request.tools)
 
+  // 修复：如果 toolResults 已经被添加到 history 中，则不应该再传递给 buildKiroPayload
+  // 因为这会导致它们被重复添加到 current message 中，造成 LLM 混淆
+  // 检查 history 的最后一条消息是否包含 toolResults
+  const lastHistoryHasToolResults = history.length > 0 && 
+    history[history.length - 1].userInputMessage?.userInputMessageContext?.toolResults !== undefined
+  
+  const toolResultsToPass = lastHistoryHasToolResults ? [] : toolResults
+
   return buildKiroPayload(
-    finalContent, modelId, origin, history, kiroTools, toolResults, images, profileArn,
+    finalContent, modelId, origin, history, kiroTools, toolResultsToPass, images, profileArn,
     { maxTokens: request.max_tokens, temperature: request.temperature, topP: request.top_p },
     thinkingEnabled, conversationId, thinkingBudget
   )
@@ -442,12 +452,23 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
     for (const block of msg.content) {
       if (block.type === 'text' && block.text) content += block.text
       else if (block.type === 'image' && block.source) {
-        images.push({ format: block.source.media_type.split('/')[1] || 'png', source: { bytes: block.source.data } })
+        if (block.source.type === 'base64' && block.source.media_type && block.source.data) {
+          images.push({ format: block.source.media_type.split('/')[1] || 'png', source: { bytes: block.source.data } })
+        }
+        // url type: Kiro backend does not support image URLs, silently skip
+      } else if (block.type === 'document' && block.source) {
+        // Flatten document content into text
+        if ((block.source as any).type === 'text' && (block.source as any).data) {
+          content += (content ? '\n' : '') + (block.source as any).data
+        } else if ((block.source as any).type === 'base64') {
+          content += (content ? '\n' : '') + '[document: base64 content not supported]'
+        }
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         let resultContent = ''
         if (typeof block.content === 'string') resultContent = block.content
         else if (Array.isArray(block.content)) resultContent = block.content.map(b => b.text || '').join('')
-        toolResults.push({ toolUseId: block.tool_use_id, content: [{ text: resultContent }], status: 'success' })
+        const isError = (block as any).is_error === true
+        toolResults.push({ toolUseId: block.tool_use_id, content: [{ text: resultContent }], status: isError ? 'error' : 'success' })
       }
     }
   }
