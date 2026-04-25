@@ -100,12 +100,30 @@ export interface ClaudeMessage {
 
 export interface ClaudeSystemBlock { type: 'text'; text: string }
 
+export interface ClaudeBase64Source {
+  type: 'base64'
+  media_type: string
+  data: string
+}
+
+export interface ClaudeTextSource {
+  type: 'text'
+  media_type: string
+  data: string
+}
+
+export interface ClaudeUrlSource {
+  type: 'url'
+  url: string
+}
+
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking'
+  type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking' | 'document'
   text?: string
   thinking?: string
   signature?: string
-  source?: { type: 'base64'; media_type: string; data: string }
+  data?: string
+  source?: ClaudeBase64Source | ClaudeTextSource | ClaudeUrlSource
   id?: string
   name?: string
   input?: unknown
@@ -135,7 +153,7 @@ export interface ClaudeStreamEvent {
   message?: Partial<ClaudeResponse>
   index?: number
   content_block?: ClaudeContentBlock
-  delta?: { type: string; text?: string; thinking?: string; stop_reason?: string; stop_sequence?: string }
+  delta?: { type: string; text?: string; thinking?: string; signature?: string; partial_json?: string; stop_reason?: string; stop_sequence?: string }
   usage?: ClaudeUsage
   error?: { type: string; message: string }
 }
@@ -145,6 +163,55 @@ export interface ClaudeUsage {
   output_tokens: number
   cache_read_input_tokens?: number
   cache_creation_input_tokens?: number
+}
+
+// ============ 归一化会话模型 ============
+export interface NormalizedConversation {
+  instructions: string[]
+  turns: NormalizedTurn[]
+  tools: NormalizedToolDefinition[]
+  currentInput: NormalizedCurrentInput
+}
+
+export type NormalizedTurn =
+  | NormalizedUserTurn
+  | NormalizedAssistantTurn
+
+export interface NormalizedUserTurn {
+  role: 'user'
+  text: string
+  images?: KiroImage[]
+  toolResults?: NormalizedToolResult[]
+}
+
+export interface NormalizedAssistantTurn {
+  role: 'assistant'
+  text: string
+  toolCalls?: NormalizedToolCall[]
+}
+
+export interface NormalizedCurrentInput {
+  text: string
+  images?: KiroImage[]
+  toolResults?: NormalizedToolResult[]
+}
+
+export interface NormalizedToolDefinition {
+  name: string
+  description: string
+  inputSchema: unknown
+}
+
+export interface NormalizedToolCall {
+  id: string
+  name: string
+  input: Record<string, unknown>
+}
+
+export interface NormalizedToolResult {
+  toolCallId: string
+  text: string
+  status: 'success' | 'error'
 }
 
 // ============ Kiro API 格式 ============
@@ -340,4 +407,3 @@ export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN'
 
 // ============ 负载均衡模式 ============
 export type LoadBalancingMode = 'smart' | 'priority' | 'balanced'
-

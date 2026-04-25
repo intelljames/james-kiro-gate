@@ -24,17 +24,10 @@ import type { ApiKey } from './lib/types.ts'
 import { AccountPool } from './lib/accountPool.ts'
 import {
   fetchKiroModels, updateModelCache, getCachedModels,
-  callKiroApiStream, callKiroApi, prewarmDNS,
+  prewarmDNS,
   getEndpointHealthStats, getDNSCacheStats, summarizeKiroPayload
 } from './lib/kiroApi.ts'
-import {
-  openaiToKiro, claudeToKiro, kiroToOpenaiResponse, kiroToClaudeResponse,
-  isThinkingModel, isClaudeThinkingEnabled, getThinkingBudgetFromRequest
-} from './lib/translator.ts'
-import {
-  ClaudeStreamHandler, OpenAIStreamHandler, claudeSSE, openaiSSE
-} from './lib/stream.ts'
-import { classifyError, CircuitBreaker } from './lib/errorHandler.ts'
+import { CircuitBreaker } from './lib/errorHandler.ts'
 import { RateLimiter } from './lib/rateLimiter.ts'
 import {
   getCompressorConfig, updateCompressorConfig, getCompressionStats,
@@ -45,6 +38,7 @@ import {
   renderDashboardPage, renderSwaggerPage, renderAccountsPage, renderApiKeysPage,
   generateOpenAPISpec
 } from './lib/pages.ts'
+import { handleAnthropicMessages, handleChatCompletions } from './lib/http_handlers.ts'
 
 // ============================================================================
 // 静态资源代理基地址
@@ -124,6 +118,27 @@ const metrics = {
 const KIRO_REFRESH_URL = (region: string) => `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`
 const KIRO_IDC_TOKEN_URL = (region: string) => `https://oidc.${region}.amazonaws.com/token`
 
+// 从 kiro-cli SQLite 读取 OIDC 凭证
+async function readKiroCliCredentials(): Promise<{ clientId: string; clientSecret: string } | null> {
+  try {
+    const dbPath = `${Deno.env.get('HOME')}/Library/Application Support/kiro-cli/data.sqlite3`
+    const cmd = new Deno.Command('sqlite3', {
+      args: [dbPath, "SELECT json_extract(value, '$.client_id'), json_extract(value, '$.client_secret') FROM auth_kv WHERE key = 'kirocli:odic:device-registration'"],
+      stdout: 'piped',
+      stderr: 'null'
+    })
+    const { stdout } = await cmd.output()
+    const output = new TextDecoder().decode(stdout).trim()
+    const parts = output.split('|')
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      return { clientId: parts[0], clientSecret: parts[1] }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 // ============================================================================
 // Token 刷新
 // ============================================================================
@@ -157,6 +172,63 @@ async function refreshAccountToken(account: ProxyAccount): Promise<boolean> {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(requestBody)
     })
+
+    // Social login 401 时自动回退到 IDC 方式
+    if (!resp.ok && (resp.status === 400 || resp.status === 401) && !isIdc) {
+      logger.warn('Auth', `Social refresh failed for ${account.email || account.id}, trying IDC fallback...`)
+
+      // 先用账号自带的 clientId/clientSecret 试
+      let idcClientId = account.clientId
+      let idcClientSecret = account.clientSecret
+
+      // 没有的话从 kiro-cli SQLite 读
+      if (!idcClientId || !idcClientSecret) {
+        const creds = await readKiroCliCredentials()
+        if (creds) {
+          idcClientId = creds.clientId
+          idcClientSecret = creds.clientSecret
+          logger.info('Auth', `Using kiro-cli credentials for IDC fallback`)
+        }
+      }
+
+      if (idcClientId && idcClientSecret) {
+        const idcResp = await fetch(KIRO_IDC_TOKEN_URL(region), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            refreshToken: account.refreshToken,
+            clientId: idcClientId,
+            clientSecret: idcClientSecret,
+            grantType: 'refresh_token'
+          })
+        })
+        if (idcResp.ok) {
+          const data = await idcResp.json()
+          const newToken = data.accessToken || data.access_token
+          const expiresIn = data.expiresIn || data.expires_in || 3600
+          if (newToken) {
+            accountPool.updateAccount(account.id, {
+              accessToken: newToken,
+              expiresAt: Date.now() + expiresIn * 1000,
+              refreshToken: data.refreshToken || data.refresh_token || account.refreshToken,
+              authMethod: account.authMethod || 'idc',
+              clientId: account.clientId || idcClientId,
+              clientSecret: account.clientSecret || idcClientSecret
+            })
+            accountPool.markRefreshComplete(account.id, true)
+            logger.info('Auth', `Token refreshed via IDC fallback for ${account.email || account.id}`)
+            return true
+          }
+        }
+        const idcText = await idcResp.text().catch(() => '')
+        logger.error('Auth', `IDC fallback failed for ${account.email || account.id}: ${idcResp.status} ${idcText.slice(0, 200)}`)
+      } else {
+        logger.error('Auth', `IDC fallback skipped: no clientId/clientSecret available for ${account.email || account.id}`)
+      }
+      accountPool.markRefreshComplete(account.id, false, undefined, true)
+      return false
+    }
+
     if (!resp.ok) {
       const text = await resp.text()
       logger.error('Auth', `Refresh failed for ${account.email || account.id}: ${resp.status} ${text.slice(0, 200)}`)
@@ -321,267 +393,6 @@ async function getAccountFromRefreshToken(refreshToken: string): Promise<ProxyAc
   accountPool.addAccount(tempAccount)
   await refreshAccountToken(tempAccount)
   return accountPool.getAccount(tempId) || tempAccount
-}
-
-// ============================================================================
-// OpenAI Chat Completions 处理器
-// ============================================================================
-async function handleChatCompletions(req: Request): Promise<Response> {
-  const authResult = await verifyApiKey(req)
-  if (!authResult.valid) {
-    return Response.json({ error: { message: 'Invalid or missing API Key', type: 'authentication_error' } }, { status: 401 })
-  }
-
-  let body: Record<string, unknown>
-  try { body = await req.json() } catch {
-    return Response.json({ error: { message: 'Invalid JSON', type: 'invalid_request_error' } }, { status: 400 })
-  }
-
-  const model = (body.model as string) || 'claude-sonnet-4.5'
-  const isStream = body.stream === true
-  const requestDebugID = createRequestDebugID('oa')
-  const thinkingHeader = detectThinkingHeader(req)
-  logger.info('API', `OpenAI: id=${requestDebugID} model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
-
-  // 限流检查
-  if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
-    return Response.json({ error: { message: 'Rate limit exceeded', type: 'rate_limit_error' } }, { status: 429 })
-  }
-
-  try {
-    // 获取账号
-    const account = authResult.refreshToken
-      ? await getAccountFromRefreshToken(authResult.refreshToken)
-      : await selectAccount(model, authResult.accountId)
-
-    // 熔断器检查
-    if (!circuitBreaker.canExecute()) {
-      return Response.json({ error: { message: 'Service temporarily unavailable (circuit breaker open)', type: 'server_error' } }, { status: 503 })
-    }
-
-    // 转换为 Kiro 格式
-    const thinkingEnabled = isThinkingModel(model) || getThinkingBudgetFromRequest(body.reasoning_effort as string | undefined, body.reasoning as { max_tokens?: number } | undefined) !== undefined
-    const kiroPayload = openaiToKiro(body as any, account.profileArn, thinkingEnabled)
-    logger.info('API', `OpenAI request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} reasoningEffort=${(body.reasoning_effort as string | undefined) ?? '-'} reasoningMax=${((body.reasoning as { max_tokens?: number } | undefined)?.max_tokens) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
-    if (settings.debugPayload) logger.info('Payload', `OpenAI id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
-
-    if (isStream) {
-      return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
-    } else {
-      return await handleOpenAINonStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
-    }
-  } catch (e) {
-    const err = e as Error
-    logger.error('API', `OpenAI error: ${err.message}`)
-    const classified = classifyError(err)
-    circuitBreaker.recordFailure()
-    return Response.json({
-      error: { message: err.message, type: classified.type === 'AUTH' ? 'authentication_error' : 'server_error' }
-    }, { status: classified.type === 'AUTH' ? 401 : classified.type === 'RATE_LIMIT' ? 429 : 500 })
-  }
-}
-
-function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Response {
-  const encoder = new TextEncoder()
-  const stream = new ReadableStream({
-    start(controller) {
-      const handler = new OpenAIStreamHandler({
-        model, enableThinkingParsing: thinkingEnabled,
-        onWrite: (data: string) => {
-          try { controller.enqueue(encoder.encode(data)); return true }
-          catch { return false }
-        }
-      })
-      handler.sendInitial()
-
-      callKiroApiStream(account, payload,
-        (text, toolUse, isThinking, toolUseStream) => {
-          if (text) handler.handleContent(text)
-          if (toolUse) {
-            if (toolUse.toolUseId === '__content_length_exceeded__') {
-              handler.handleContentLengthExceeded()
-            } else {
-              handler.handleToolUse(toolUse.toolUseId, toolUse.name, toolUse.input, true)
-            }
-          }
-          if (toolUseStream) {
-            handler.handleToolUse(
-              toolUseStream.toolUseId, toolUseStream.name,
-              toolUseStream.inputFragment, toolUseStream.isStop || false
-            )
-          }
-        },
-        (usage) => {
-          handler.finish({
-            inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-            cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens,
-            reasoningTokens: usage.reasoningTokens,
-            contextWindowExceeded: usage.contextWindowExceeded,
-            truncated: usage.truncated
-          })
-          circuitBreaker.recordSuccess()
-          accountPool.recordSuccess(account.id, usage.outputTokens)
-          controller.close()
-        },
-        (error) => {
-          circuitBreaker.recordFailure()
-          accountPool.recordError(account.id, 'other')
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: error.message })}\n\n`))
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          } catch { /* ignore */ }
-          controller.close()
-        },
-        undefined, undefined, thinkingEnabled, undefined, { requestID: requestDebugID }
-      )
-    }
-  })
-
-  return new Response(stream, {
-    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' }
-  })
-}
-
-async function handleOpenAINonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Promise<Response> {
-  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled, { requestID: requestDebugID })
-  circuitBreaker.recordSuccess()
-  accountPool.recordSuccess(account.id, result.usage.outputTokens)
-  const response = kiroToOpenaiResponse(result.content, result.toolUses, {
-    inputTokens: result.usage.inputTokens,
-    outputTokens: result.usage.outputTokens,
-    cacheReadTokens: result.usage.cacheReadTokens,
-    cacheWriteTokens: result.usage.cacheWriteTokens,
-    reasoningTokens: result.usage.reasoningTokens,
-    contextWindowExceeded: result.usage.contextWindowExceeded,
-    truncated: result.usage.truncated
-  }, model, result.thinkingContent || undefined)
-  return Response.json(response)
-}
-
-// ============================================================================
-// Anthropic Messages 处理器
-// ============================================================================
-async function handleAnthropicMessages(req: Request): Promise<Response> {
-  const authResult = await verifyApiKey(req)
-  if (!authResult.valid) {
-    return Response.json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid or missing API Key' } }, { status: 401 })
-  }
-
-  let body: Record<string, unknown>
-  try { body = await req.json() } catch {
-    return Response.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON' } }, { status: 400 })
-  }
-
-  const model = (body.model as string) || 'claude-sonnet-4.5'
-  const isStream = body.stream === true
-  const requestDebugID = createRequestDebugID('cl')
-  const thinkingHeader = detectThinkingHeader(req)
-  logger.info('API', `Claude: id=${requestDebugID} model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
-
-  if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
-    return Response.json({ type: 'error', error: { type: 'rate_limit_error', message: 'Rate limit exceeded' } }, { status: 429 })
-  }
-
-  try {
-    const account = authResult.refreshToken
-      ? await getAccountFromRefreshToken(authResult.refreshToken)
-      : await selectAccount(model, authResult.accountId)
-
-    if (!circuitBreaker.canExecute()) {
-      return Response.json({ type: 'error', error: { type: 'overloaded_error', message: 'Service temporarily unavailable' } }, { status: 529 })
-    }
-
-    const thinkingEnabled = isClaudeThinkingEnabled(body.thinking) || isThinkingModel(model)
-    const kiroPayload = claudeToKiro(body as any, account.profileArn, thinkingEnabled)
-    logger.info('API', `Claude request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingBody=${JSON.stringify(body.thinking ?? null)} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
-    if (settings.debugPayload) logger.info('Payload', `Claude id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
-
-    if (isStream) {
-      return handleClaudeStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
-    } else {
-      return await handleClaudeNonStream(account, kiroPayload, model, thinkingEnabled, requestDebugID)
-    }
-  } catch (e) {
-    const err = e as Error
-    logger.error('API', `Claude error: ${err.message}`)
-    circuitBreaker.recordFailure()
-    return Response.json({ type: 'error', error: { type: 'api_error', message: err.message } }, { status: 500 })
-  }
-}
-
-function handleClaudeStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Response {
-  const encoder = new TextEncoder()
-  const stream = new ReadableStream({
-    start(controller) {
-      const handler = new ClaudeStreamHandler({
-        model, inputTokens: 0, enableThinkingParsing: thinkingEnabled,
-        onWrite: (data: string) => {
-          try { controller.enqueue(encoder.encode(data)); return true }
-          catch { return false }
-        }
-      })
-      handler.sendMessageStart()
-
-      callKiroApiStream(account, payload,
-        (text, toolUse, isThinking, toolUseStream) => {
-          if (text) handler.handleContent(text)
-          if (toolUse) {
-            if (toolUse.toolUseId === '__content_length_exceeded__') {
-              handler.handleContentLengthExceeded()
-            } else {
-              handler.handleToolUse(toolUse.toolUseId, toolUse.name, toolUse.input, true)
-            }
-          }
-          if (toolUseStream) {
-            handler.handleToolUse(
-              toolUseStream.toolUseId, toolUseStream.name,
-              toolUseStream.inputFragment, toolUseStream.isStop || false
-            )
-          }
-        },
-        (usage) => {
-          handler.finish({
-            inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-            cacheReadTokens: usage.cacheReadTokens,
-            cacheWriteTokens: usage.cacheWriteTokens,
-            contextWindowExceeded: usage.contextWindowExceeded,
-            truncated: usage.truncated
-          })
-          circuitBreaker.recordSuccess()
-          accountPool.recordSuccess(account.id, usage.outputTokens)
-          controller.close()
-        },
-        (error) => {
-          circuitBreaker.recordFailure()
-          accountPool.recordError(account.id, 'other')
-          try {
-            controller.enqueue(encoder.encode(claudeSSE.error(error.message)))
-          } catch { /* ignore */ }
-          controller.close()
-        },
-        undefined, undefined, thinkingEnabled, undefined, { requestID: requestDebugID }
-      )
-    }
-  })
-
-  return new Response(stream, {
-    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' }
-  })
-}
-
-async function handleClaudeNonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, requestDebugID: string): Promise<Response> {
-  const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled, { requestID: requestDebugID })
-  circuitBreaker.recordSuccess()
-  accountPool.recordSuccess(account.id, result.usage.outputTokens)
-  const response = kiroToClaudeResponse(result.content, result.toolUses, {
-    inputTokens: result.usage.inputTokens,
-    outputTokens: result.usage.outputTokens,
-    cacheReadTokens: result.usage.cacheReadTokens,
-    cacheWriteTokens: result.usage.cacheWriteTokens,
-    contextWindowExceeded: result.usage.contextWindowExceeded,
-    truncated: result.usage.truncated
-  }, model, result.thinkingContent || undefined)
-  return Response.json(response)
 }
 
 // ============================================================================
@@ -995,7 +806,17 @@ async function handleRequest(req: Request): Promise<Response> {
     // OpenAI Chat Completions
     if (method === 'POST' && path === '/v1/chat/completions') {
       metrics.totalRequests++
-      const r = await handleChatCompletions(req)
+      const r = await handleChatCompletions(req, {
+        settings,
+        accountPool,
+        rateLimiter,
+        circuitBreaker,
+        verifyApiKey,
+        getAccountFromRefreshToken,
+        selectAccount,
+        createRequestDebugID,
+        detectThinkingHeader,
+      })
       const duration = Date.now() - startTime
       recordRequest({ timestamp: Date.now(), method, path, status: r.status, duration, apiType: 'openai' })
       return addCorsHeaders(r)
@@ -1004,7 +825,17 @@ async function handleRequest(req: Request): Promise<Response> {
     // Anthropic Messages
     if (method === 'POST' && (path === '/v1/messages' || path === '/messages')) {
       metrics.totalRequests++
-      const r = await handleAnthropicMessages(req)
+      const r = await handleAnthropicMessages(req, {
+        settings,
+        accountPool,
+        rateLimiter,
+        circuitBreaker,
+        verifyApiKey,
+        getAccountFromRefreshToken,
+        selectAccount,
+        createRequestDebugID,
+        detectThinkingHeader,
+      })
       const duration = Date.now() - startTime
       recordRequest({ timestamp: Date.now(), method, path, status: r.status, duration, apiType: 'anthropic' })
       return addCorsHeaders(r)

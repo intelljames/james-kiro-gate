@@ -47,9 +47,15 @@ function previewText(value: string | undefined, limit = 800): string {
   return value.length > limit ? `${value.slice(0, limit)} ...[truncated ${value.length - limit} chars]` : value
 }
 
+function isStructuralEmptyUserMessage(message: KiroHistoryMessage): boolean {
+  const user = message.userInputMessage
+  if (!user) return false
+  return user.content === '' && !user.images?.length && !user.userInputMessageContext?.tools?.length && !user.userInputMessageContext?.toolResults?.length
+}
+
 export function summarizeKiroPayload(payload: KiroPayload): Record<string, unknown> {
   const current = payload.conversationState.currentMessage.userInputMessage
-  const history = payload.conversationState.history || []
+  const history = (payload.conversationState.history || []).filter((item) => !isStructuralEmptyUserMessage(item))
   return {
     conversationId: payload.conversationState.conversationId,
     agentTaskType: payload.conversationState.agentTaskType,
@@ -75,6 +81,38 @@ export function summarizeKiroPayload(payload: KiroPayload): Record<string, unkno
     inferenceConfig: payload.inferenceConfig,
     profileArnPresent: !!payload.profileArn,
   }
+}
+
+function sanitizeHistoryMessages(history: KiroHistoryMessage[] | undefined): KiroHistoryMessage[] | undefined {
+  if (!history?.length) return undefined
+
+  const cleaned: KiroHistoryMessage[] = []
+  for (const msg of history) {
+    if (msg.assistantResponseMessage) {
+      if (msg.assistantResponseMessage.toolUses) {
+        const valid = msg.assistantResponseMessage.toolUses.filter((tu) => tu.toolUseId?.trim() && tu.name?.trim())
+        msg.assistantResponseMessage.toolUses = valid.length > 0 ? valid : undefined
+      }
+    }
+    if (msg.userInputMessage) {
+      if (msg.userInputMessage.userInputMessageContext?.toolResults) {
+        const valid = msg.userInputMessage.userInputMessageContext.toolResults.filter((r) => r.toolUseId?.trim())
+        if (valid.length === 0) {
+          delete msg.userInputMessage.userInputMessageContext.toolResults
+        } else {
+          const seen = new Map<string, KiroToolResult>()
+          for (const r of valid) seen.set(r.toolUseId, r)
+          msg.userInputMessage.userInputMessageContext.toolResults = Array.from(seen.values())
+        }
+      }
+      if (msg.userInputMessage.userInputMessageContext) {
+        const ctx = msg.userInputMessage.userInputMessageContext
+        if (!ctx.tools?.length && !ctx.toolResults?.length) delete msg.userInputMessage.userInputMessageContext
+      }
+    }
+    cleaned.push(msg)
+  }
+  return cleaned.length > 0 ? cleaned : undefined
 }
 
 const KIRO_ENDPOINTS = [
@@ -314,54 +352,6 @@ export function injectSystemPrompts(
 }
 
 // ============ 孤立 tool_use 清理 ============
-function findOrphanedToolUseIds(messages: KiroHistoryMessage[]): Set<string> {
-  const resultIds = new Set<string>()
-  for (const msg of messages) {
-    const results = msg.userInputMessage?.userInputMessageContext?.toolResults
-    if (results) for (const r of results) resultIds.add(r.toolUseId)
-  }
-  const orphanedIds = new Set<string>()
-  for (let i = 0; i < messages.length; i++) {
-    const toolUses = messages[i].assistantResponseMessage?.toolUses
-    if (!toolUses) continue
-    for (const tu of toolUses) {
-      if (!resultIds.has(tu.toolUseId) && i !== messages.length - 1) {
-        orphanedIds.add(tu.toolUseId)
-      }
-    }
-  }
-  return orphanedIds
-}
-
-function removeOrphanedToolUses(messages: KiroHistoryMessage[]): KiroHistoryMessage[] {
-  const orphanedIds = findOrphanedToolUseIds(messages)
-  if (orphanedIds.size === 0) return messages
-  logger.info('KiroAPI', `Removing ${orphanedIds.size} orphaned tool_use(s)`)
-  return messages.map(msg => {
-    if (!msg.assistantResponseMessage?.toolUses) return msg
-    const filtered = msg.assistantResponseMessage.toolUses.filter(tu => !orphanedIds.has(tu.toolUseId))
-    if (filtered.length === msg.assistantResponseMessage.toolUses.length) return msg
-    return { ...msg, assistantResponseMessage: { ...msg.assistantResponseMessage, toolUses: filtered.length > 0 ? filtered : undefined } }
-  })
-}
-
-function ensureHistoryToolsDefined(tools: KiroToolWrapper[], history: KiroHistoryMessage[]): KiroToolWrapper[] {
-  const currentNames = new Set(tools.map(t => t.toolSpecification.name.toLowerCase()))
-  const missing = new Set<string>()
-  for (const msg of history) {
-    const toolUses = msg.assistantResponseMessage?.toolUses
-    if (toolUses) for (const tu of toolUses) {
-      if (!currentNames.has(tu.name.toLowerCase())) missing.add(tu.name)
-    }
-  }
-  if (missing.size === 0) return tools
-  const placeholders: KiroToolWrapper[] = Array.from(missing).map(name => ({
-    toolSpecification: { name, description: `Tool: ${name}`, inputSchema: { json: { type: 'object', properties: {} } } }
-  }))
-  logger.debug('KiroAPI', `Added ${placeholders.length} placeholder tool(s) for history`)
-  return [...tools, ...placeholders]
-}
-
 function validateToolResults(toolResults: KiroToolResult[], history: KiroHistoryMessage[]): KiroToolResult[] {
   if (toolResults.length === 0) return toolResults
   const allToolUseIds = new Set<string>()
@@ -380,31 +370,16 @@ function validateToolResults(toolResults: KiroToolResult[], history: KiroHistory
 }
 
 // ============ 消息清理 ============
-const HELLO_MESSAGE: KiroHistoryMessage = { userInputMessage: { content: 'Hello', origin: 'AI_EDITOR' } }
-const CONTINUE_MESSAGE: KiroHistoryMessage = { userInputMessage: { content: 'Continue', origin: 'AI_EDITOR' } }
-const UNDERSTOOD_MESSAGE: KiroHistoryMessage = { assistantResponseMessage: { content: 'understood' } }
-
-function createFailedToolUseMessage(toolUseIds: string[]): KiroHistoryMessage {
-  return { userInputMessage: { content: '', origin: 'AI_EDITOR', userInputMessageContext: {
-    toolResults: toolUseIds.map(toolUseId => ({ toolUseId, content: [{ text: 'Tool execution failed' }], status: 'error' as const }))
-  }}}
-}
+const EMPTY_USER_PLACEHOLDER: KiroHistoryMessage = { userInputMessage: { content: '', origin: 'AI_EDITOR' } }
 
 function isUserInputMessage(msg: KiroHistoryMessage): boolean { return msg != null && 'userInputMessage' in msg && msg.userInputMessage != null }
 function isAssistantResponseMessage(msg: KiroHistoryMessage): boolean { return msg != null && 'assistantResponseMessage' in msg && msg.assistantResponseMessage != null }
 function hasToolResults(msg: KiroHistoryMessage): boolean { return !!(msg.userInputMessage?.userInputMessageContext?.toolResults?.length) }
 function hasToolUses(msg: KiroHistoryMessage): boolean { return !!(msg.assistantResponseMessage?.toolUses?.length) }
 
-function hasMatchingToolResults(toolUses: KiroToolUse[] | undefined, toolResults: KiroToolResult[] | undefined): boolean {
-  if (!toolUses || !toolUses.length) return true
-  if (!toolResults || !toolResults.length) return false
-  const resultIds = new Set(toolResults.map(r => r.toolUseId))
-  return toolUses.every(tu => resultIds.has(tu.toolUseId))
-}
-
 // 单遍清理会话消息
 function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessage[] {
-  if (messages.length === 0) return [HELLO_MESSAGE]
+  if (messages.length === 0) return [EMPTY_USER_PLACEHOLDER]
   const result: KiroHistoryMessage[] = []
   let firstUserSeen = false
   for (let i = 0; i < messages.length; i++) {
@@ -418,22 +393,13 @@ function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessag
     }
     if (result.length > 0) {
       const prev = result[result.length - 1]
-      if (isUserInputMessage(prev) && isUserInputMessage(msg)) result.push(UNDERSTOOD_MESSAGE)
-      else if (isAssistantResponseMessage(prev) && isAssistantResponseMessage(msg)) result.push(CONTINUE_MESSAGE)
+      if (isAssistantResponseMessage(prev) && isAssistantResponseMessage(msg)) result.push(EMPTY_USER_PLACEHOLDER)
     }
     result.push(msg)
-    if (isAssistantResponseMessage(msg) && hasToolUses(msg)) {
-      const next = i + 1 < messages.length ? messages[i + 1] : null
-      if (!next || !isUserInputMessage(next) || !hasToolResults(next) ||
-          !hasMatchingToolResults(msg.assistantResponseMessage?.toolUses, next.userInputMessage?.userInputMessageContext?.toolResults)) {
-        const toolUses = msg.assistantResponseMessage?.toolUses ?? []
-        result.push(createFailedToolUseMessage(toolUses.map((tu, idx) => tu.toolUseId ?? `toolUse_${idx + 1}`)))
-      }
-    }
   }
-  if (result.length === 0 || !isUserInputMessage(result[0])) result.unshift(HELLO_MESSAGE)
-  if (!isUserInputMessage(result[result.length - 1])) result.push(CONTINUE_MESSAGE)
-  return removeOrphanedToolUses(result)
+  if (result.length === 0) return [EMPTY_USER_PLACEHOLDER]
+  if (!isUserInputMessage(result[result.length - 1])) result.push(EMPTY_USER_PLACEHOLDER)
+  return result
 }
 
 // ============ 构建 Kiro API Payload ============
@@ -453,8 +419,13 @@ export function buildKiroPayload(
   effortOverride?: string
 ): KiroPayload {
   const isAgentic = tools.length > 0
-  const contentWithPrompts = injectSystemPrompts(content, isAgentic, thinkingEnabled, thinkingBudget, thinkingType, effortOverride)
-  const finalContent = contentWithPrompts.trim() || (toolResults.length > 0 ? '' : 'Continue')
+  const preserveEmptyCurrentContent = content.length === 0 && toolResults.length === 0
+  const contentWithPrompts = preserveEmptyCurrentContent
+    ? ''
+    : injectSystemPrompts(content, isAgentic, thinkingEnabled, thinkingBudget, thinkingType, effortOverride)
+  const finalContent = preserveEmptyCurrentContent
+    ? ''
+    : contentWithPrompts.trim()
 
   const currentUserInputMessage: KiroUserInputMessage = { content: finalContent, modelId, origin }
   if (images.length > 0) currentUserInputMessage.images = images
@@ -467,18 +438,18 @@ export function buildKiroPayload(
   }
 
   const currentMessage: KiroHistoryMessage = { userInputMessage: currentUserInputMessage }
-  const allMessages = [...history, currentMessage]
+  const sanitizedHistory = sanitizeHistoryMessages(history) ?? []
+  const allMessages = [...sanitizedHistory, currentMessage]
   const sanitizedMessages = sanitizeConversation(allMessages)
-  const sanitizedHistory = sanitizedMessages.slice(0, -1)
+  const finalSanitizedHistory = sanitizedMessages.slice(0, -1)
   let finalCurrentMessage = sanitizedMessages.at(-1)!
 
   if (!finalCurrentMessage.userInputMessage) {
-    finalCurrentMessage = { userInputMessage: { content: finalContent || 'Continue', modelId, origin } }
+    finalCurrentMessage = { userInputMessage: { content: finalContent, modelId, origin } }
   }
   if (tools.length > 0) {
-    const allTools = ensureHistoryToolsDefined(tools, sanitizedHistory)
     finalCurrentMessage.userInputMessage!.userInputMessageContext = {
-      ...finalCurrentMessage.userInputMessage!.userInputMessageContext, tools: allTools
+      ...finalCurrentMessage.userInputMessage!.userInputMessageContext, tools
     }
   }
 
@@ -486,7 +457,7 @@ export function buildKiroPayload(
     conversationState: {
       chatTriggerType: 'MANUAL', conversationId: conversationId || uuidv4(),
       currentMessage: { userInputMessage: finalCurrentMessage.userInputMessage! },
-      history: sanitizedHistory.length > 0 ? sanitizedHistory : undefined,
+      history: finalSanitizedHistory.length > 0 ? finalSanitizedHistory : undefined,
       agentContinuationId: uuidv4(), agentTaskType: 'vibe'
     }
   }
@@ -503,86 +474,15 @@ export function buildKiroPayload(
     }
   }
 
-  logger.debug('KiroAPI', `Payload: convId=${payload.conversationState.conversationId.substring(0,8)}... content=${finalContent.length} history=${sanitizedHistory.length} tools=${tools.length}`)
+  logger.debug('KiroAPI', `Payload: convId=${payload.conversationState.conversationId.substring(0,8)}... content=${finalContent.length} history=${finalSanitizedHistory.length} tools=${tools.length}`)
   return payload
 }
 
 // ============ 深度清理 Payload ============
 function deepSanitizePayload(payload: KiroPayload): KiroPayload {
   const cs = payload.conversationState
-  if (cs.currentMessage?.userInputMessage) {
-    if (!cs.currentMessage.userInputMessage.content?.trim()) cs.currentMessage.userInputMessage.content = 'Continue'
-  }
-  if (cs.history && cs.history.length > 0) {
-    const cleaned: KiroHistoryMessage[] = []
-    for (const msg of cs.history) {
-      if (msg.assistantResponseMessage) {
-        if (!msg.assistantResponseMessage.content?.trim()) msg.assistantResponseMessage.content = 'I understand.'
-        if (msg.assistantResponseMessage.toolUses) {
-          const valid = msg.assistantResponseMessage.toolUses.filter(tu => tu.toolUseId?.trim() && tu.name?.trim())
-          msg.assistantResponseMessage.toolUses = valid.length > 0 ? valid : undefined
-        }
-      }
-      if (msg.userInputMessage) {
-        if (!msg.userInputMessage.content?.trim() && !msg.userInputMessage.userInputMessageContext?.toolResults?.length) {
-          msg.userInputMessage.content = 'Continue'
-        }
-        if (msg.userInputMessage.userInputMessageContext?.toolResults) {
-          const valid = msg.userInputMessage.userInputMessageContext.toolResults.filter(r => r.toolUseId?.trim())
-          if (valid.length === 0) { delete msg.userInputMessage.userInputMessageContext.toolResults }
-          else {
-            const seen = new Map<string, KiroToolResult>()
-            for (const r of valid) seen.set(r.toolUseId, r)
-            msg.userInputMessage.userInputMessageContext.toolResults = Array.from(seen.values())
-          }
-        }
-        if (msg.userInputMessage.userInputMessageContext) {
-          const ctx = msg.userInputMessage.userInputMessageContext
-          if (!ctx.tools?.length && !ctx.toolResults?.length) delete msg.userInputMessage.userInputMessageContext
-        }
-      }
-      cleaned.push(msg)
-    }
-    // 确保交替排列
-    const alternated: KiroHistoryMessage[] = []
-    for (const msg of cleaned) {
-      if (alternated.length > 0) {
-        const prevIsUser = !!alternated[alternated.length - 1].userInputMessage
-        const currIsUser = !!msg.userInputMessage
-        if (prevIsUser === currIsUser) {
-          alternated.push(currIsUser ? { assistantResponseMessage: { content: 'understood' } } : { userInputMessage: { content: 'Continue', origin: 'AI_EDITOR' } })
-        }
-      }
-      alternated.push(msg)
-    }
-    if (alternated.length > 0 && !alternated[0].userInputMessage) alternated.unshift(HELLO_MESSAGE)
-    if (alternated.length > 0 && alternated[alternated.length - 1].userInputMessage) {
-      alternated.push({ assistantResponseMessage: { content: 'understood' } })
-    }
-    cs.history = alternated.length > 0 ? alternated : undefined
-  }
+  cs.history = sanitizeHistoryMessages(cs.history)
   return payload
-}
-
-// 激进清理：剥离所有工具调用历史
-function aggressiveSanitizePayload(payload: KiroPayload): KiroPayload {
-  const cs = payload.conversationState
-  if (cs.history && cs.history.length > 0) {
-    const textOnly: KiroHistoryMessage[] = []
-    for (const msg of cs.history) {
-      if (msg.assistantResponseMessage) {
-        textOnly.push({ assistantResponseMessage: { content: msg.assistantResponseMessage.content || 'I understand.' } })
-      } else if (msg.userInputMessage) {
-        textOnly.push({ userInputMessage: { content: msg.userInputMessage.content?.trim() || 'Continue', origin: msg.userInputMessage.origin || 'AI_EDITOR' } })
-      }
-    }
-    cs.history = textOnly.length > 0 ? textOnly : undefined
-  }
-  if (cs.currentMessage?.userInputMessage?.userInputMessageContext?.toolResults) {
-    delete cs.currentMessage.userInputMessage.userInputMessageContext.toolResults
-  }
-  logger.warn('KiroAPI', `Aggressive sanitize: stripped all tool history, keeping ${cs.history?.length || 0} text-only messages`)
-  return deepSanitizePayload(payload)
 }
 
 // 认证头
@@ -649,6 +549,94 @@ function calculateRetryDelayMs(attempt: number): number {
   return exp + Math.floor(Math.random() * Math.max(1, Math.floor(exp / 4)))
 }
 
+function applyContentLengthTruncation(history: KiroHistoryMessage[] | undefined, tier: number): KiroHistoryMessage[] | undefined {
+  if (!history?.length) return history
+  const tierRatios = [0.5, 0.25, 0]
+  if (tier < 0 || tier >= tierRatios.length) return history
+
+  const ratio = tierRatios[tier]
+  if (ratio === 0) return []
+  const keep = Math.max(1, Math.floor(history.length * ratio))
+  return history.slice(-keep)
+}
+
+function isContentLengthError(errorDetail: string): boolean {
+  return errorDetail.includes('too long') || errorDetail.includes('CONTENT_LENGTH') || errorDetail.includes('context_length')
+}
+
+function isRateLimitedStatus(status: number): boolean {
+  return status === 429
+}
+
+function isServerErrorStatus(status: number): boolean {
+  return status >= 500
+}
+
+function isQuotaExhaustedStatus(status: number): boolean {
+  return status === 402
+}
+
+function isAuthStatus(status: number): boolean {
+  return status === 401 || status === 403
+}
+
+type HttpResponseDecision =
+  | { type: 'switch_endpoint'; error: Error; delayMs: number }
+  | { type: 'throw'; error: Error }
+  | { type: 'truncate_history'; nextHistory: KiroHistoryMessage[]; error: Error }
+  | { type: 'retry_same_endpoint'; error: Error; delayMs: number }
+  | { type: 'accept' }
+
+async function decideHttpResponseAction(
+  response: Response,
+  payload: KiroPayload,
+  contentTruncationTier: number,
+  totalRetries: number,
+): Promise<HttpResponseDecision> {
+  if (isRateLimitedStatus(response.status)) {
+    return { type: 'switch_endpoint', error: new Error('Rate limited'), delayMs: 1000 }
+  }
+  if (isQuotaExhaustedStatus(response.status)) {
+    const error = new Error('QUOTA_EXHAUSTED')
+    ;(error as any).isQuotaError = true
+    ;(error as any).statusCode = 402
+    return { type: 'throw', error }
+  }
+  if (isAuthStatus(response.status)) {
+    const detail = await response.text().catch(() => '')
+    return {
+      type: 'throw',
+      error: new Error(detail ? `Auth error ${response.status}: ${detail.substring(0, 500)}` : `Auth error ${response.status}`),
+    }
+  }
+  if (response.status === 400) {
+    const body = await response.text().catch(() => '')
+    let errorDetail = body
+    try {
+      const parsed = JSON.parse(body)
+      errorDetail = parsed.message || parsed.error?.message || body
+    } catch {
+      // Ignore parse failure and use raw body.
+    }
+    const error = new Error(`Bad Request: ${errorDetail}`)
+    if (isContentLengthError(errorDetail) && payload.conversationState.history?.length) {
+      const truncated = applyContentLengthTruncation(payload.conversationState.history, contentTruncationTier)
+      if (truncated !== payload.conversationState.history) {
+        return { type: 'truncate_history', nextHistory: truncated ?? [], error }
+      }
+    }
+    return { type: 'throw', error }
+  }
+  if (isServerErrorStatus(response.status)) {
+    const delayMs = Math.min(500 * Math.pow(2, totalRetries), 2000)
+    return { type: 'retry_same_endpoint', error: new Error(`Server error ${response.status}`), delayMs }
+  }
+  if (!response.ok) {
+    return { type: 'throw', error: new Error(`API error ${response.status}`) }
+  }
+  return { type: 'accept' }
+}
+
 // ============ 流式 API 调用 ============
 export async function callKiroApiStream(
   account: ProxyAccount, payload: KiroPayload,
@@ -663,7 +651,6 @@ export async function callKiroApiStream(
   let lastError: Error | null = null
   const startTime = Date.now()
   let totalRetries = 0
-  let badRequestRetried = false
   let contentTruncationTier = 0
   let shouldAbortAllEndpoints = false
 
@@ -697,48 +684,35 @@ export async function callKiroApiStream(
         const requestStartTime = Date.now()
         const response = await fetchWithTimeout(endpoint.url, { method: 'POST', headers, body: payloadStr, signal }, API_CONFIG.requestTimeout)
 
-        if (response.status === 429) {
+        const decision = await decideHttpResponseAction(response, payload, contentTruncationTier, totalRetries)
+        if (decision.type === 'switch_endpoint') {
           logger.info('KiroAPI', 'Rate limited (429), switching endpoint...')
-          recordEndpointFailure(endpoint.name); lastError = new Error('Rate limited')
-          await new Promise(r => setTimeout(r, 1000)); break
+          recordEndpointFailure(endpoint.name)
+          lastError = decision.error
+          await new Promise(r => setTimeout(r, decision.delayMs))
+          break
         }
-        if (response.status === 402) {
-          const e = new Error('QUOTA_EXHAUSTED'); (e as any).isQuotaError = true; (e as any).statusCode = 402; throw e
+        if (decision.type === 'throw') {
+          throw decision.error
         }
-        if (response.status === 401 || response.status === 403) {
-          const detail = await response.text().catch(() => '')
-          throw new Error(detail ? `Auth error ${response.status}: ${detail.substring(0, 500)}` : `Auth error ${response.status}`)
+        if (decision.type === 'truncate_history') {
+          const orig = payload.conversationState.history ?? []
+          lastError = decision.error
+          payload.conversationState.history = decision.nextHistory
+          logger.warn('KiroAPI', `Content error tier ${contentTruncationTier + 1}: truncating history ${orig.length} -> ${decision.nextHistory.length}`)
+          deepSanitizePayload(payload)
+          contentTruncationTier++
+          totalRetries++
+          continue
         }
-        if (response.status === 400) {
-          const body = await response.text().catch(() => '')
-          let errorDetail = body
-          try { const p = JSON.parse(body); errorDetail = p.message || p.error?.message || body } catch {}
-          const isContentError = errorDetail.includes('too long') || errorDetail.includes('CONTENT_LENGTH') || errorDetail.includes('context_length')
-          if (isContentError && payload.conversationState.history?.length) {
-            const tierRatios = [0.5, 0.25, 0]
-            if (contentTruncationTier < tierRatios.length) {
-              const orig = payload.conversationState.history
-              const ratio = tierRatios[contentTruncationTier]
-              const keep = ratio === 0 ? 0 : Math.max(1, Math.floor(orig.length * ratio))
-              payload.conversationState.history = ratio === 0 ? [] : orig.slice(-keep)
-              logger.warn('KiroAPI', `Content error tier ${contentTruncationTier + 1}: truncating history ${orig.length} -> ${payload.conversationState.history.length}`)
-              deepSanitizePayload(payload); contentTruncationTier++; totalRetries++; continue
-            }
-          }
-          if (!badRequestRetried && payload.conversationState.history?.length) {
-            badRequestRetried = true
-            logger.warn('KiroAPI', `Bad Request (400): ${errorDetail.substring(0, 200)}, retrying with aggressive sanitization`)
-            aggressiveSanitizePayload(payload); totalRetries++; continue
-          }
-          throw new Error(`Bad Request: ${errorDetail}`)
+        if (decision.type === 'retry_same_endpoint') {
+          recordEndpointFailure(endpoint.name)
+          logger.warn('KiroAPI', `${decision.error.message}, retrying after ${decision.delayMs}ms...`)
+          lastError = decision.error
+          await new Promise(r => setTimeout(r, decision.delayMs))
+          totalRetries++
+          continue
         }
-        if (response.status >= 500) {
-          const backoff = Math.min(500 * Math.pow(2, totalRetries), 2000)
-          logger.warn('KiroAPI', `Server error ${response.status}, retrying after ${backoff}ms...`)
-          lastError = new Error(`Server error ${response.status}`)
-          await new Promise(r => setTimeout(r, backoff)); totalRetries++; continue
-        }
-        if (!response.ok) throw new Error(`API error ${response.status}`)
 
         const connectLatency = Date.now() - requestStartTime
         logger.info('KiroAPI', `Connected to ${endpoint.name} in ${connectLatency}ms`)
@@ -1156,4 +1130,3 @@ export async function fetchKiroModels(account: ProxyAccount): Promise<KiroModel[
     throw error
   }
 }
-

@@ -6,8 +6,9 @@ let kv: Deno.Kv | null = null
 
 async function getKV(): Promise<Deno.Kv> {
   if (!kv) {
-    kv = await Deno.openKv()
-    logger.info('Storage', 'Deno KV initialized')
+    const kvPath = `${Deno.cwd()}/kirogate.kv`
+    kv = await Deno.openKv(kvPath)
+    logger.info('Storage', `Deno KV initialized at ${kvPath}`)
   }
   return kv
 }

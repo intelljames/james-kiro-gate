@@ -36,21 +36,38 @@
 ```
 kirogate/
 ├── main.ts              # 入口 + HTTP 路由 + 管理 API
+├── CHANGELOG.md         # 变更记录
 ├── lib/
-│   ├── types.ts         # 类型定义
-│   ├── kiroApi.ts       # Kiro API 客户端（双端点、DNS 缓存、机器码）
-│   ├── accountPool.ts   # 多账号智能调度池
-│   ├── translator.ts    # 格式转换（OpenAI ↔ Kiro ↔ Claude）
-│   ├── stream.ts        # 流处理（AWS Event Stream + SSE）
-│   ├── compressor.ts    # 上下文压缩（三层缓存 + AI 摘要）
-│   ├── storage.ts       # Deno KV 存储层
-│   ├── rateLimiter.ts   # 令牌桶限流
-│   ├── errorHandler.ts  # 错误分类 + 熔断器
-│   ├── logger.ts        # 日志系统
-│   └── pages.ts         # 嵌入式 HTML 前端页面
-├── deno.json            # Deno 配置
-├── Dockerfile
-└── docker-compose.yml
+│   ├── types.ts                 # 类型定义和归一化会话类型
+│   ├── kiroApi.ts               # Kiro API 客户端（双端点、重试、状态决策）
+│   ├── kiroCompiler.ts          # OpenAI / Anthropic -> Kiro 请求编译层
+│   ├── http_handlers.ts         # OpenAI / Anthropic HTTP 处理器
+│   ├── translator.ts            # 协议适配（OpenAI / Anthropic ↔ Kiro）
+│   ├── stream.ts                # 流处理（AWS Event Stream + SSE）
+│   ├── accountPool.ts           # 多账号智能调度池
+│   ├── compressor.ts            # 上下文压缩（三层缓存 + AI 摘要）
+│   ├── storage.ts               # Deno KV 存储层
+│   ├── rateLimiter.ts           # 令牌桶限流
+│   ├── errorHandler.ts          # 错误分类 + 熔断器
+│   ├── logger.ts                # 日志系统
+│   ├── toolCallDebugger.ts      # tool loop 调试追踪
+│   └── pages.ts                 # 嵌入式 HTML 前端页面
+├── testapi/                     # 上游 Kiro API 黑盒 canary
+├── lib/*_test.ts                # 本地单元 / 集成回归测试
+└── deno.json            # Deno 配置
+```
+
+## 🧪 测试
+
+```bash
+# 类型检查
+deno check main.ts lib/http_handlers.ts lib/kiroApi.ts
+
+# 本地回归测试
+deno test lib/kiroApi_test.ts lib/kiroCompiler_test.ts lib/translator_test.ts lib/gateway_integration_test.ts lib/http_handlers_test.ts
+
+# 上游 Kiro API 黑盒 canary
+deno test --allow-net --allow-env --allow-read --allow-write --allow-run=sqlite3 --unstable-kv testapi/kiro_api_behavior_test.ts
 ```
 
 ## 🚀 快速开始

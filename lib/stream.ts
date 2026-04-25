@@ -88,6 +88,11 @@ function pendingTagSuffix(buffer: string, tag: string): number {
   return 0
 }
 
+function generateThinkingSignature(thinking: string): string {
+  const sample = thinking.slice(0, 32).replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
+  return btoa(`kiro:${thinking.length}:${sample}`).replace(/=/g, '')
+}
+
 // ============ Thinking 缓冲解析器 ============
 export class ThinkingBufferParser {
   private buffer = ''
@@ -229,10 +234,11 @@ export const claudeSSE = {
     else if (blockType === 'tool_use') { contentBlock.id = toolUseId; contentBlock.name = toolName; contentBlock.input = {} }
     return sseFormat('content_block_start', { type: 'content_block_start', index, content_block: contentBlock })
   },
-  contentBlockDelta: (index: number, deltaType: 'text_delta' | 'thinking_delta' | 'input_json_delta', content: string) => {
+  contentBlockDelta: (index: number, deltaType: 'text_delta' | 'thinking_delta' | 'input_json_delta' | 'signature_delta', content: string) => {
     let delta: Record<string, unknown>
     if (deltaType === 'text_delta') delta = { type: 'text_delta', text: content }
     else if (deltaType === 'thinking_delta') delta = { type: 'thinking_delta', thinking: content }
+    else if (deltaType === 'signature_delta') delta = { type: 'signature_delta', signature: content }
     else delta = { type: 'input_json_delta', partial_json: content }
     return sseFormat('content_block_delta', { type: 'content_block_delta', index, delta })
   },
@@ -355,6 +361,11 @@ export class ClaudeStreamHandler {
 
   private closeCurrentBlock(): void {
     if (this.currentBlockType && this.contentBlockStartSent) {
+      // Emit signature_delta before closing thinking blocks (required by Anthropic protocol)
+      if (this.currentBlockType === 'thinking') {
+        const signature = generateThinkingSignature(this.thinkingBuffer.join(''))
+        this.onWrite(claudeSSE.contentBlockDelta(this.contentBlockIndex, 'signature_delta', signature))
+      }
       this.onWrite(claudeSSE.contentBlockStop(this.contentBlockIndex))
       this.stateManager.onContentBlockStop()
       this.currentBlockType = null; this.contentBlockStartSent = false
