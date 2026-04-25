@@ -450,6 +450,7 @@ export class ClaudeStreamHandler {
   }
   getToolCalls(): KiroToolUse[] { return this.toolCalls }
   getResponseText(): string { return this.responseBuffer.join('') }
+  getThinkingText(): string { return this.thinkingBuffer.join('') }
   getOutputTokens(): number { return this.outputTokens }
   isEnded(): boolean { return this.responseEnded }
   getMessageId(): string { return this.messageId }
@@ -601,6 +602,7 @@ export class OpenAIStreamHandler {
   handleThinkingOverflow(): void { if (this.enableThinkingParsing) this.thinkingParser.reset() }
   getToolCalls(): Array<{ id: string; name: string; arguments: string }> { return this.toolCalls }
   getResponseText(): string { return this.responseBuffer.join('') }
+  getThinkingText(): string { return this.thinkingBuffer.join('') }
   getOutputTokens(): number { return this.outputTokens }
   isEnded(): boolean { return this.responseEnded }
   getRequestId(): string { return this.requestId }

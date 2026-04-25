@@ -51,6 +51,31 @@ export interface ChatHandlerDeps {
   detectThinkingHeader: (req: Request) => string
 }
 
+export function summarizeIncomingOpenAIRequest(body: Record<string, unknown>, thinkingHeader: string): Record<string, unknown> {
+  return {
+    model: body.model ?? null,
+    thinkingHeader: thinkingHeader || null,
+    reasoningEffort: body.reasoning_effort ?? null,
+    reasoning: body.reasoning ?? null,
+    thinking: body.thinking ?? null,
+    stream: body.stream === true,
+    messageCount: (body.messages as unknown[])?.length || 0,
+    toolCount: (body.tools as unknown[])?.length || 0,
+  }
+}
+
+export function summarizeIncomingClaudeRequest(body: Record<string, unknown>, thinkingHeader: string): Record<string, unknown> {
+  return {
+    model: body.model ?? null,
+    thinkingHeader: thinkingHeader || null,
+    thinking: body.thinking ?? null,
+    maxTokens: body.max_tokens ?? null,
+    stream: body.stream === true,
+    messageCount: (body.messages as unknown[])?.length || 0,
+    toolCount: (body.tools as unknown[])?.length || 0,
+  }
+}
+
 export async function handleChatCompletions(req: Request, deps: ChatHandlerDeps): Promise<Response> {
   const authResult = await deps.verifyApiKey(req)
   if (!authResult.valid) {
@@ -67,6 +92,8 @@ export async function handleChatCompletions(req: Request, deps: ChatHandlerDeps)
   const requestDebugID = deps.createRequestDebugID('oa')
   const thinkingHeader = deps.detectThinkingHeader(req)
   createToolCallSession(requestDebugID)
+
+  logger.info('API', `OpenAI ingress id=${requestDebugID} ${JSON.stringify(summarizeIncomingOpenAIRequest(body, thinkingHeader))}`)
 
   traceToolCallFlow(requestDebugID, 'request', 'openai', body, {
     hasTools: !!(body.tools as unknown[])?.length,
@@ -92,7 +119,7 @@ export async function handleChatCompletions(req: Request, deps: ChatHandlerDeps)
       return Response.json({ error: { message: 'Service temporarily unavailable (circuit breaker open)', type: 'server_error' } }, { status: 503 })
     }
 
-    const thinkingEnabled = isThinkingModel(model) || getThinkingBudgetFromRequest(body.reasoning_effort as string | undefined, body.reasoning as { max_tokens?: number } | undefined) !== undefined
+    const thinkingEnabled = isThinkingModel(model) || isClaudeThinkingEnabled(body.thinking) || getThinkingBudgetFromRequest(body.reasoning_effort as string | undefined, body.reasoning as { max_tokens?: number } | undefined) !== undefined
     const kiroPayload = openaiToKiro(body as any, account.profileArn, thinkingEnabled)
 
     traceToolCallFlow(requestDebugID, 'kiro_request', 'kiro', kiroPayload, {
@@ -164,9 +191,17 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
           const finalResponse = {
             toolCalls: handler.getToolCalls(),
             responseText: handler.getResponseText(),
+            reasoningText: handler.getThinkingText(),
             outputTokens: handler.getOutputTokens(),
             usage,
           }
+          logger.info('API', `OpenAI egress id=${requestDebugID} ${JSON.stringify({
+            finish: handler.getToolCalls().length > 0 ? 'tool_calls' : (usage.truncated || usage.contextWindowExceeded ? 'length' : 'stop'),
+            contentChars: handler.getResponseText().length,
+            reasoningChars: handler.getThinkingText().length,
+            toolCalls: handler.getToolCalls().length,
+            outputTokens: usage.outputTokens,
+          })}`)
           traceToolCallFlow(requestDebugID, 'response', 'openai', finalResponse, {
             toolCallsCount: handler.getToolCalls().length,
             hasToolCalls: handler.getToolCalls().length > 0,
@@ -230,6 +265,13 @@ async function handleOpenAINonStream(account: ProxyAccount, payload: any, model:
     contextWindowExceeded: result.usage.contextWindowExceeded,
     truncated: result.usage.truncated,
   }, model, result.thinkingContent || undefined)
+  logger.info('API', `OpenAI egress id=${requestDebugID} ${JSON.stringify({
+    finish: response.choices?.[0]?.finish_reason || null,
+    contentChars: result.content.length,
+    reasoningChars: (result.thinkingContent || '').length,
+    toolCalls: result.toolUses.length,
+    outputTokens: result.usage.outputTokens,
+  })}`)
   traceToolCallFlow(requestDebugID, 'response', 'openai', response, {
     toolCallsCount: response.choices?.[0]?.message?.tool_calls?.length || 0,
     hasToolCalls: !!(response.choices?.[0]?.message?.tool_calls?.length),
@@ -259,6 +301,8 @@ export async function handleAnthropicMessages(req: Request, deps: ChatHandlerDep
   const requestDebugID = deps.createRequestDebugID('cl')
   const thinkingHeader = deps.detectThinkingHeader(req)
   createToolCallSession(requestDebugID)
+
+  logger.info('API', `Claude ingress id=${requestDebugID} ${JSON.stringify(summarizeIncomingClaudeRequest(body, thinkingHeader))}`)
 
   traceToolCallFlow(requestDebugID, 'request', 'anthropic', body, {
     hasTools: !!(body.tools as unknown[])?.length,
@@ -327,6 +371,13 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
           }
         },
         (usage) => {
+          logger.info('API', `Claude egress id=${requestDebugID} ${JSON.stringify({
+            finish: handler.getToolCalls().length > 0 ? 'tool_use' : (usage.truncated || usage.contextWindowExceeded ? 'max_tokens' : 'end_turn'),
+            contentChars: handler.getResponseText().length,
+            reasoningChars: handler.getThinkingText().length,
+            toolCalls: handler.getToolCalls().length,
+            outputTokens: usage.outputTokens,
+          })}`)
           handler.finish({
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
@@ -367,5 +418,12 @@ async function handleClaudeNonStream(account: ProxyAccount, payload: any, model:
     contextWindowExceeded: result.usage.contextWindowExceeded,
     truncated: result.usage.truncated,
   }, model, result.thinkingContent || undefined)
+  logger.info('API', `Claude egress id=${requestDebugID} ${JSON.stringify({
+    finish: response.stop_reason,
+    contentChars: result.content.length,
+    reasoningChars: (result.thinkingContent || '').length,
+    toolCalls: result.toolUses.length,
+    outputTokens: result.usage.outputTokens,
+  })}`)
   return Response.json(response)
 }

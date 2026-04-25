@@ -94,7 +94,7 @@ function extractSessionFromClaude(request: ClaudeRequest): string | undefined {
 
 // ============ OpenAI → Kiro 转换 ============
 export function openaiToKiro(
-  request: OpenAIChatRequest & { user?: string },
+  request: OpenAIChatRequest & { user?: string; thinking?: { type?: string; budget_tokens?: number } },
   profileArn?: string, thinkingEnabledOverride?: boolean
 ): KiroPayload {
   const sessionId = extractSessionFromOpenAI(request)
@@ -103,8 +103,11 @@ export function openaiToKiro(
   // thinking 模式检测
   const modelHasThinking = isThinkingModel(request.model)
   const budgetFromParams = getThinkingBudgetFromRequest(request.reasoning_effort, request.reasoning)
-  const thinkingEnabled = thinkingEnabledOverride === true || modelHasThinking || budgetFromParams !== undefined
-  const thinkingBudget = budgetFromParams
+  const thinkingFromBody = isClaudeThinkingEnabled(request.thinking)
+  const budgetFromBody = thinkingFromBody ? getClaudeThinkingBudget(request.thinking) : undefined
+  const effectiveBudget = budgetFromBody ?? budgetFromParams
+  const thinkingEnabled = thinkingEnabledOverride === true || modelHasThinking || thinkingFromBody || budgetFromParams !== undefined
+  const thinkingBudget = effectiveBudget
 
   return openAIRequestToNormalizedKiroPayload(
     request,
