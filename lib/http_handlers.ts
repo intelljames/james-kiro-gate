@@ -46,6 +46,10 @@ export function summarizeFullPayloadDebugInfo(
   }
 }
 
+export function shouldLogEgressPreview(settings: Pick<HandlerSettings, 'debugPayload' | 'debugFullPayload'>): boolean {
+  return settings.debugPayload || settings.debugFullPayload
+}
+
 function previewBoundaryText(value: string, limit = 240): string {
   if (value.length <= limit * 2) return value
   return `${value.slice(0, limit)} ...[truncated ${value.length - limit * 2} chars]... ${value.slice(-limit)}`
@@ -225,11 +229,13 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
             toolCalls: handler.getToolCalls().length,
             outputTokens: usage.outputTokens,
           })}`)
-          logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
-            contentPreview: previewBoundaryText(handler.getResponseText()),
-            reasoningPreview: previewBoundaryText(handler.getThinkingText()),
-            toolCalls: handler.getToolCalls(),
-          })}`)
+          if (shouldLogEgressPreview(deps.settings)) {
+            logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
+              contentPreview: previewBoundaryText(handler.getResponseText()),
+              reasoningPreview: previewBoundaryText(handler.getThinkingText()),
+              toolCalls: handler.getToolCalls(),
+            })}`)
+          }
           traceToolCallFlow(requestDebugID, 'response', 'openai', finalResponse, {
             toolCallsCount: handler.getToolCalls().length,
             hasToolCalls: handler.getToolCalls().length > 0,
@@ -300,11 +306,13 @@ async function handleOpenAINonStream(account: ProxyAccount, payload: any, model:
     toolCalls: result.toolUses.length,
     outputTokens: result.usage.outputTokens,
   })}`)
-  logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
-    contentPreview: previewBoundaryText(result.content),
-    reasoningPreview: previewBoundaryText(result.thinkingContent || ''),
-    toolCalls: result.toolUses,
-  })}`)
+  if (shouldLogEgressPreview(deps.settings)) {
+    logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
+      contentPreview: previewBoundaryText(result.content),
+      reasoningPreview: previewBoundaryText(result.thinkingContent || ''),
+      toolCalls: result.toolUses,
+    })}`)
+  }
   traceToolCallFlow(requestDebugID, 'response', 'openai', response, {
     toolCallsCount: response.choices?.[0]?.message?.tool_calls?.length || 0,
     hasToolCalls: !!(response.choices?.[0]?.message?.tool_calls?.length),

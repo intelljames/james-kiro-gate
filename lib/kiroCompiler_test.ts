@@ -237,3 +237,29 @@ Deno.test('compiler mirrors latest plain user turn into history when prior turns
   assertEquals(history[2].userInputMessage?.content, 'Latest question')
   assertEquals(payload.conversationState.currentMessage.userInputMessage.content.includes('Latest question'), true)
 })
+
+Deno.test('compiler does not mirror image-only current turns into history', () => {
+  const normalized: NormalizedConversation = {
+    instructions: [],
+    turns: [
+      { role: 'user', text: 'Describe this image' },
+      { role: 'assistant', text: 'Send it over.' },
+    ],
+    tools: [],
+    currentInput: {
+      text: '',
+      images: [{ format: 'png', source: { bytes: 'abc123' } }],
+    },
+  }
+
+  const payload = compileNormalizedConversationToKiroPayload(
+    normalized,
+    'claude-sonnet-4.5',
+    'AI_EDITOR',
+  )
+
+  const history = payload.conversationState.history ?? []
+  assertEquals(history.length, 2)
+  assertEquals(history.some((item) => item.userInputMessage?.images?.length), false)
+  assertEquals(payload.conversationState.currentMessage.userInputMessage.images, undefined)
+})

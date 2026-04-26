@@ -14,7 +14,7 @@
 - Added `lib/http_handlers.ts` to isolate OpenAI and Anthropic HTTP request handling from `main.ts` for narrower testing.
 - Added black-box canary documentation under `testapi/README.md` for validating behavior against the upstream Kiro API.
 - Added `TOOL_CALL_DEBUGGING_KNOWHOW.md` documenting the PM2 log workflow, payload inspection method, and confirmed root causes for the OpenAI/Kiro turn-alignment bug.
-- Added full payload and response preview debug logging for OpenAI/Claude requests so future reproductions can compare request tails, compiled Kiro history/current state, and final egress text directly.
+- Added full payload debug logging for OpenAI/Claude requests and OpenAI egress preview logging so future reproductions can compare request tails, compiled Kiro history/current state, and final egress text directly.
 
 ### Changed
 - Reworked OpenAI and Anthropic request translation to use the normalized compiler path instead of ad hoc provider-specific Kiro history shaping.

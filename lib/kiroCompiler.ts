@@ -310,11 +310,10 @@ function mirrorCurrentPlainUserTurnIntoHistory(
 ): NormalizedTurn[] {
   const hasPriorTurns = turns.length > 0
   const hasText = currentInput.text.trim() !== ''
-  const hasImages = !!currentInput.images?.length
   const hasToolResults = !!currentInput.toolResults?.length
   const lastTurn = turns.at(-1)
   const lastTurnIsAssistant = lastTurn?.role === 'assistant'
-  if (!hasPriorTurns || !lastTurnIsAssistant || (!hasText && !hasImages) || hasToolResults) return turns
+  if (!hasPriorTurns || !lastTurnIsAssistant || !hasText || hasToolResults) return turns
 
   return [
     ...turns,

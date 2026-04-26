@@ -32,7 +32,7 @@ Restart with:
 pm2 restart kirogate --update-env
 ```
 
-Useful log lines per request id:
+Useful log lines per OpenAI request id:
 
 - `OpenAI ingress id=...`
 - `Payload`
@@ -40,6 +40,8 @@ Useful log lines per request id:
 - `KiroAPI Request debug requestID=...`
 - `OpenAI egress id=...`
 - `OpenAI egress preview id=...`
+
+For Claude requests, the added deep-debug path is `PayloadFull`; there is no matching `Claude egress preview` log today.
 
 ## How To Read A Failing Turn
 

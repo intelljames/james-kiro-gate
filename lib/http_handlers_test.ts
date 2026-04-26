@@ -7,6 +7,7 @@ import { AccountPool } from './accountPool.ts'
 import {
   handleAnthropicMessages,
   handleChatCompletions,
+  shouldLogEgressPreview,
   summarizeFullPayloadDebugInfo,
   summarizeIncomingOpenAIRequest,
   type ChatHandlerDeps,
@@ -121,4 +122,10 @@ Deno.test('summarizeFullPayloadDebugInfo includes request and full payload detai
   assertStringIncludes(serialized, 'kiroPayload')
   assertStringIncludes(serialized, 'claude-sonnet-4.6')
   assertStringIncludes(serialized, 'claude-sonnet-4.5')
+})
+
+Deno.test('egress preview logging stays gated behind debug flags', () => {
+  assertEquals(shouldLogEgressPreview({ debugPayload: false, debugFullPayload: false }), false)
+  assertEquals(shouldLogEgressPreview({ debugPayload: true, debugFullPayload: false }), true)
+  assertEquals(shouldLogEgressPreview({ debugPayload: false, debugFullPayload: true }), true)
 })
