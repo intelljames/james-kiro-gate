@@ -103,6 +103,9 @@ function sanitizeHistoryMessages(history: KiroHistoryMessage[] | undefined): Kir
           const seen = new Map<string, KiroToolResult>()
           for (const r of valid) seen.set(r.toolUseId, r)
           msg.userInputMessage.userInputMessageContext.toolResults = Array.from(seen.values())
+          if (msg.userInputMessage.content === '') {
+            msg.userInputMessage.content = 'Tool results provided.'
+          }
         }
       }
       if (msg.userInputMessage.userInputMessageContext) {

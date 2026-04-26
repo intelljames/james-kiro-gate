@@ -158,7 +158,6 @@ export function normalizeOpenAIConversation(
     currentInput = { text: lastTurn.text, images: lastTurn.images, toolResults: lastTurn.toolResults }
     turns.pop()
   } else {
-    flushPendingToolResults(turns, pendingToolResults)
     if (pendingToolResults.length > 0) {
       currentInput = { text: '', toolResults: [...pendingToolResults] }
       pendingToolResults.length = 0
@@ -271,10 +270,10 @@ function mergeInstructionIntoCurrentInput(currentInput: NormalizedCurrentInput, 
   }
 }
 
-function ensureCurrentInput(normalized: NormalizedConversation): NormalizedCurrentInput {
-  const currentInput = mergeInstructionIntoCurrentInput(normalized.currentInput, normalized.instructions)
-  if (currentInput.text || currentInput.images?.length || currentInput.toolResults?.length) return currentInput
-  return { text: buildInstructionPreamble(normalized.instructions) }
+function ensureCurrentInput(currentInput: NormalizedCurrentInput, instructions: string[]): NormalizedCurrentInput {
+  const merged = mergeInstructionIntoCurrentInput(currentInput, instructions)
+  if (merged.text || merged.images?.length || merged.toolResults?.length) return merged
+  return { text: buildInstructionPreamble(instructions) }
 }
 
 function splitCurrentToolResultsFromContinuation(
@@ -283,10 +282,16 @@ function splitCurrentToolResultsFromContinuation(
 ): { historyTurns: NormalizedTurn[]; currentInput: NormalizedCurrentInput } {
   if (!currentInput.toolResults?.length) return { historyTurns: turns, currentInput }
 
+  const hasContinuationText = currentInput.text.trim() !== ''
+  const hasContinuationImages = !!currentInput.images?.length
+  if (!hasContinuationText && !hasContinuationImages) {
+    return { historyTurns: turns, currentInput }
+  }
+
   const historyTurns = [...turns]
   historyTurns.push({
     role: 'user',
-    text: '',
+    text: 'Tool results provided.',
     toolResults: currentInput.toolResults,
   })
 
@@ -297,6 +302,28 @@ function splitCurrentToolResultsFromContinuation(
       images: currentInput.images,
     },
   }
+}
+
+function mirrorCurrentPlainUserTurnIntoHistory(
+  turns: NormalizedTurn[],
+  currentInput: NormalizedCurrentInput,
+): NormalizedTurn[] {
+  const hasPriorTurns = turns.length > 0
+  const hasText = currentInput.text.trim() !== ''
+  const hasImages = !!currentInput.images?.length
+  const hasToolResults = !!currentInput.toolResults?.length
+  const lastTurn = turns.at(-1)
+  const lastTurnIsAssistant = lastTurn?.role === 'assistant'
+  if (!hasPriorTurns || !lastTurnIsAssistant || (!hasText && !hasImages) || hasToolResults) return turns
+
+  return [
+    ...turns,
+    {
+      role: 'user',
+      text: currentInput.text,
+      images: currentInput.images,
+    },
+  ]
 }
 
 function toKiroHistory(turns: NormalizedTurn[], modelId: string, origin: string) {
@@ -342,8 +369,9 @@ export function compileNormalizedConversationToKiroPayload(
   thinkingType?: 'enabled' | 'adaptive' | null,
   effortOverride?: string,
 ): KiroPayload {
-  const ensuredCurrentInput = ensureCurrentInput(normalized)
-  const { historyTurns, currentInput } = splitCurrentToolResultsFromContinuation(normalized.turns, ensuredCurrentInput)
+  const split = splitCurrentToolResultsFromContinuation(normalized.turns, normalized.currentInput)
+  const historyTurns = mirrorCurrentPlainUserTurnIntoHistory(split.historyTurns, split.currentInput)
+  const currentInput = ensureCurrentInput(split.currentInput, normalized.instructions)
   const history = toKiroHistory(historyTurns, modelId, origin)
   const currentToolResults = currentInput.toolResults?.map((result) => ({
     toolUseId: result.toolCallId,

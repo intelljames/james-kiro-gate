@@ -434,7 +434,7 @@ Deno.test('compiler emits history tool loop and current tools without visible pl
   assertEquals(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.[0]?.toolSpecification.name, 'get_weather')
   assert(!history.some((item) => item.assistantResponseMessage?.content === 'understood'))
   assert(!history.some((item) => item.assistantResponseMessage?.content === 'I understand.'))
-  assert(!history.some((item) => item.userInputMessage?.content === 'Tool results provided.'))
+  assertEquals(history[2].userInputMessage?.content, 'Tool results provided.')
 })
 
 Deno.test('ClaudeStreamHandler emits signature_delta before thinking block stop', () => {

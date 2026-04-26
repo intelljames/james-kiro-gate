@@ -94,7 +94,7 @@ function extractSessionFromClaude(request: ClaudeRequest): string | undefined {
 
 // ============ OpenAI → Kiro 转换 ============
 export function openaiToKiro(
-  request: OpenAIChatRequest & { user?: string; thinking?: { type?: string; budget_tokens?: number } },
+  request: OpenAIChatRequest & { user?: string },
   profileArn?: string, thinkingEnabledOverride?: boolean
 ): KiroPayload {
   const sessionId = extractSessionFromOpenAI(request)

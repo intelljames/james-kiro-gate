@@ -58,6 +58,7 @@ interface AppSettings {
   rateLimitPerMinute: number
   enableCompression: boolean
   debugPayload: boolean
+  debugFullPayload: boolean
 }
 
 function loadSettings(): AppSettings {
@@ -69,6 +70,7 @@ function loadSettings(): AppSettings {
     rateLimitPerMinute: parseInt(Deno.env.get('RATE_LIMIT_PER_MINUTE') || '0'),
     enableCompression: Deno.env.get('ENABLE_COMPRESSION') !== 'false',
     debugPayload: Deno.env.get('DEBUG_KIRO_PAYLOAD') === 'true',
+    debugFullPayload: Deno.env.get('DEBUG_KIRO_FULL_PAYLOAD') === 'true',
   }
 }
 

@@ -29,6 +29,26 @@ export interface HandlerSettings {
   proxyApiKey: string
   rateLimitPerMinute: number
   debugPayload: boolean
+  debugFullPayload: boolean
+}
+
+export function summarizeFullPayloadDebugInfo(
+  requestDebugID: string,
+  format: 'openai' | 'anthropic',
+  requestBody: Record<string, unknown>,
+  kiroPayload: unknown,
+): Record<string, unknown> {
+  return {
+    requestDebugID,
+    format,
+    requestBody,
+    kiroPayload,
+  }
+}
+
+function previewBoundaryText(value: string, limit = 240): string {
+  if (value.length <= limit * 2) return value
+  return `${value.slice(0, limit)} ...[truncated ${value.length - limit * 2} chars]... ${value.slice(-limit)}`
 }
 
 export interface AuthResult {
@@ -131,6 +151,9 @@ export async function handleChatCompletions(req: Request, deps: ChatHandlerDeps)
     logger.info('API', `OpenAI request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} reasoningEffort=${(body.reasoning_effort as string | undefined) ?? '-'} reasoningMax=${((body.reasoning as { max_tokens?: number } | undefined)?.max_tokens) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
 
     if (deps.settings.debugPayload) logger.info('Payload', `OpenAI id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
+    if (deps.settings.debugFullPayload) {
+      logger.info('PayloadFull', `OpenAI id=${requestDebugID} ${JSON.stringify(summarizeFullPayloadDebugInfo(requestDebugID, 'openai', body, kiroPayload))}`)
+    }
 
     if (isStream) {
       return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled, requestDebugID, deps)
@@ -202,6 +225,11 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
             toolCalls: handler.getToolCalls().length,
             outputTokens: usage.outputTokens,
           })}`)
+          logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
+            contentPreview: previewBoundaryText(handler.getResponseText()),
+            reasoningPreview: previewBoundaryText(handler.getThinkingText()),
+            toolCalls: handler.getToolCalls(),
+          })}`)
           traceToolCallFlow(requestDebugID, 'response', 'openai', finalResponse, {
             toolCallsCount: handler.getToolCalls().length,
             hasToolCalls: handler.getToolCalls().length > 0,
@@ -272,6 +300,11 @@ async function handleOpenAINonStream(account: ProxyAccount, payload: any, model:
     toolCalls: result.toolUses.length,
     outputTokens: result.usage.outputTokens,
   })}`)
+  logger.info('API', `OpenAI egress preview id=${requestDebugID} ${JSON.stringify({
+    contentPreview: previewBoundaryText(result.content),
+    reasoningPreview: previewBoundaryText(result.thinkingContent || ''),
+    toolCalls: result.toolUses,
+  })}`)
   traceToolCallFlow(requestDebugID, 'response', 'openai', response, {
     toolCallsCount: response.choices?.[0]?.message?.tool_calls?.length || 0,
     hasToolCalls: !!(response.choices?.[0]?.message?.tool_calls?.length),
@@ -332,6 +365,9 @@ export async function handleAnthropicMessages(req: Request, deps: ChatHandlerDep
     const kiroPayload = claudeToKiro(body as any, account.profileArn, thinkingEnabled)
     logger.info('API', `Claude request debug id=${requestDebugID} thinkingHeader=${thinkingHeader || '-'} thinkingBody=${JSON.stringify(body.thinking ?? null)} thinkingEnabled=${thinkingEnabled} maxTokens=${(body.max_tokens as number | undefined) ?? '-'} payloadReasoning=${kiroPayload.inferenceConfig?.reasoningConfig ? JSON.stringify(kiroPayload.inferenceConfig.reasoningConfig) : 'off'} history=${kiroPayload.conversationState.history?.length || 0} tools=${kiroPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
     if (deps.settings.debugPayload) logger.info('Payload', `Claude id=${requestDebugID} ${JSON.stringify(summarizeKiroPayload(kiroPayload))}`)
+    if (deps.settings.debugFullPayload) {
+      logger.info('PayloadFull', `Claude id=${requestDebugID} ${JSON.stringify(summarizeFullPayloadDebugInfo(requestDebugID, 'anthropic', body, kiroPayload))}`)
+    }
 
     if (isStream) {
       return handleClaudeStream(account, kiroPayload, model, thinkingEnabled, requestDebugID, deps)

@@ -1,10 +1,17 @@
-import { assertEquals } from 'https://deno.land/std/assert/mod.ts'
+import { assertEquals, assertStringIncludes } from 'https://deno.land/std/assert/mod.ts'
 
 import type { ProxyAccount } from './types.ts'
 import { CircuitBreaker } from './errorHandler.ts'
 import { RateLimiter } from './rateLimiter.ts'
 import { AccountPool } from './accountPool.ts'
-import { handleAnthropicMessages, handleChatCompletions, type ChatHandlerDeps } from './http_handlers.ts'
+import {
+  handleAnthropicMessages,
+  handleChatCompletions,
+  summarizeFullPayloadDebugInfo,
+  summarizeIncomingOpenAIRequest,
+  type ChatHandlerDeps,
+} from './http_handlers.ts'
+import { buildKiroPayload } from './kiroApi.ts'
 
 function makeDeps(): ChatHandlerDeps {
   const accountPool = new AccountPool()
@@ -26,6 +33,7 @@ function makeDeps(): ChatHandlerDeps {
       proxyApiKey: 'test-key',
       rateLimitPerMinute: 0,
       debugPayload: false,
+      debugFullPayload: false,
     },
     accountPool,
     rateLimiter,
@@ -74,4 +82,43 @@ Deno.test('handleAnthropicMessages rejects request missing max_tokens', async ()
   } finally {
     deps.rateLimiter.destroy()
   }
+})
+
+Deno.test('handleChatCompletions logs incoming thinking-related request fields', async () => {
+  const summary = summarizeIncomingOpenAIRequest({
+    model: 'claude-sonnet-4.6-kiro',
+    reasoning_effort: 'high',
+    reasoning: { max_tokens: 2048 },
+    thinking: { type: 'enabled', budget_tokens: 4096 },
+    stream: true,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ type: 'function', function: { name: 'demo' } }],
+  }, 'thinking-2025-01-01')
+
+  const serialized = JSON.stringify(summary)
+  assertStringIncludes(serialized, 'claude-sonnet-4.6-kiro')
+  assertStringIncludes(serialized, 'thinking-2025-01-01')
+  assertStringIncludes(serialized, 'reasoningEffort')
+  assertStringIncludes(serialized, 'budget_tokens')
+})
+
+Deno.test('summarizeFullPayloadDebugInfo includes request and full payload details', () => {
+  const requestBody = {
+    model: 'claude-sonnet-4.6',
+    stream: true,
+    messages: [
+      { role: 'user', content: 'hello' },
+    ],
+    tools: [{ type: 'function', function: { name: 'demo', parameters: { type: 'object' } } }],
+  }
+
+  const payload = buildKiroPayload('hello', 'claude-sonnet-4.5', 'AI_EDITOR')
+  const summary = summarizeFullPayloadDebugInfo('oa-test', 'openai', requestBody, payload)
+  const serialized = JSON.stringify(summary)
+
+  assertStringIncludes(serialized, 'oa-test')
+  assertStringIncludes(serialized, 'requestBody')
+  assertStringIncludes(serialized, 'kiroPayload')
+  assertStringIncludes(serialized, 'claude-sonnet-4.6')
+  assertStringIncludes(serialized, 'claude-sonnet-4.5')
 })
